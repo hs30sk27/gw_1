@@ -65,7 +65,8 @@ static void prv_fmt_batt(char* out, size_t out_sz, uint8_t batt_lvl)
         (void)snprintf(out, out_sz, "NA");
         return;
     }
-    (void)snprintf(out, out_sz, "%u", (unsigned)batt_lvl);
+    (void)snprintf(out, out_sz, "%s",
+                   (batt_lvl == UI_NODE_BATT_LVL_NORMAL) ? "Y" : "N");
 }
 
 static void prv_fmt_temp_c(char* out, size_t out_sz, int8_t temp_c)
