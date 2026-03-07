@@ -134,6 +134,10 @@ static void prv_send_setting_read(void)
     (void)snprintf(line, sizeof(line), "ND NUM:%u\r\n", cfg->max_nodes);
     UI_UART_SendString(line);
 
+    /* GW 번호(0..2)도 같이 확인 가능하도록 출력 */
+    (void)snprintf(line, sizeof(line), "GW NUM:%u\r\n", cfg->gw_num);
+    UI_UART_SendString(line);
+
     (void)snprintf(line, sizeof(line), "SETTING:%c%c%c\r\n",
                    (char)cfg->setting_ascii[0],
                    (char)cfg->setting_ascii[1],
@@ -243,6 +247,29 @@ void UI_Cmd_ProcessLine(const char* line_in)
         }
         UI_SetNetId(net_id);
         (void)prv_commit_config_changed();
+        return;
+    }
+
+    /* -------------------- GW NUM:xx --------------------- */
+    if (strncmp(p, "GW NUM:", 7) == 0)
+    {
+        uint8_t v = 0;
+        if (prv_parse_u8_dec(p + 7, &v) <= 0)
+        {
+            prv_send_error();
+            return;
+        }
+
+        /* GW 번호는 0,1,2만 허용 */
+        if (v <= 2u)
+        {
+            UI_SetGwNum(v);
+            (void)prv_commit_config_changed();
+        }
+        else
+        {
+            prv_send_error();
+        }
         return;
     }
 
