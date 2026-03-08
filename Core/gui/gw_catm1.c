@@ -78,6 +78,15 @@ static uint8_t s_time_sync_delta_count = 0u;
 #ifndef GW_CATM1_CCLK_QUERY_COMP_MAX_CENTI
 #define GW_CATM1_CCLK_QUERY_COMP_MAX_CENTI (250u)
 #endif
+#ifndef GW_CATM1_POST_SMS_READY_SETTLE_MS
+#define GW_CATM1_POST_SMS_READY_SETTLE_MS (1500u)
+#endif
+#ifndef GW_CATM1_POST_SMS_READY_AT_SYNC_WINDOW_MS
+#define GW_CATM1_POST_SMS_READY_AT_SYNC_WINDOW_MS (8000u)
+#endif
+#ifndef GW_CATM1_POST_SMS_READY_RETRY_GAP_MS
+#define GW_CATM1_POST_SMS_READY_RETRY_GAP_MS (300u)
+#endif
 
 #ifndef GW_TCP_INTERNAL_TEMP_COMP_C
 #define GW_TCP_INTERNAL_TEMP_COMP_C ((int8_t)-4)
@@ -609,6 +618,45 @@ static bool prv_wait_boot_sms_ready(void)
     return prv_uart_wait_for(rsp, sizeof(rsp), GW_CATM1_BOOT_URC_WAIT_MS, "SMS Ready", NULL, NULL);
 }
 
+static bool prv_wait_at_sync_after_sms_ready(void)
+{
+    uint32_t start = HAL_GetTick();
+    uint32_t elapsed = 0u;
+
+    prv_wait_rx_quiet(GW_CATM1_BOOT_QUIET_MS, GW_CATM1_BOOT_QUIET_MS + 400u);
+
+    elapsed = (uint32_t)(HAL_GetTick() - start);
+    if (elapsed < GW_CATM1_POST_SMS_READY_SETTLE_MS) {
+        prv_delay_ms(GW_CATM1_POST_SMS_READY_SETTLE_MS - elapsed);
+    }
+
+    while ((uint32_t)(HAL_GetTick() - start) < GW_CATM1_POST_SMS_READY_AT_SYNC_WINDOW_MS) {
+        prv_uart_flush_rx();
+        if (prv_send_at_sync()) {
+            return true;
+        }
+
+        prv_wait_rx_quiet(200u, 1000u);
+        elapsed = (uint32_t)(HAL_GetTick() - start);
+        if (elapsed >= GW_CATM1_POST_SMS_READY_AT_SYNC_WINDOW_MS) {
+            break;
+        }
+
+        {
+            uint32_t gap_ms = GW_CATM1_POST_SMS_READY_RETRY_GAP_MS;
+            uint32_t remain_ms = GW_CATM1_POST_SMS_READY_AT_SYNC_WINDOW_MS - elapsed;
+            if (gap_ms > remain_ms) {
+                gap_ms = remain_ms;
+            }
+            if (gap_ms != 0u) {
+                prv_delay_ms(gap_ms);
+            }
+        }
+    }
+
+    return false;
+}
+
 static bool prv_start_session(bool enable_time_auto_update)
 {
     char rsp[UI_CATM1_RX_BUF_SZ];
@@ -622,9 +670,7 @@ static bool prv_start_session(bool enable_time_auto_update)
     if (!prv_wait_boot_sms_ready()) {
         return false;
     }
-    prv_wait_rx_quiet(GW_CATM1_BOOT_QUIET_MS, GW_CATM1_BOOT_QUIET_MS + 200u);
-    prv_uart_flush_rx();
-    if (!prv_send_at_sync()) {
+    if (!prv_wait_at_sync_after_sms_ready()) {
         return false;
     }
 
