@@ -1516,6 +1516,58 @@ static void prv_append_fmt(char* out, size_t out_sz, size_t* io_len, const char*
     *io_len += (size_t)n;
 }
 
+
+static void prv_fmt_batt_yn(char* out, size_t out_sz, uint8_t batt_lvl)
+{
+    if ((out == NULL) || (out_sz == 0u))
+    {
+        return;
+    }
+
+    if (batt_lvl == UI_NODE_BATT_LVL_INVALID)
+    {
+        (void)snprintf(out, out_sz, "NA");
+        return;
+    }
+
+    (void)snprintf(out, out_sz, "%s",
+                   (batt_lvl == UI_NODE_BATT_LVL_NORMAL) ? "Y" : "N");
+}
+
+static void prv_fmt_temp_c_ascii(char* out, size_t out_sz, int8_t temp_c)
+{
+    if ((out == NULL) || (out_sz == 0u))
+    {
+        return;
+    }
+
+    if (temp_c == UI_NODE_TEMP_INVALID_C)
+    {
+        (void)snprintf(out, out_sz, "NA");
+        return;
+    }
+
+    (void)snprintf(out, out_sz, "%d", (int)temp_c);
+}
+
+static void prv_fmt_volt_x10_ascii(char* out, size_t out_sz, uint8_t volt_x10)
+{
+    if ((out == NULL) || (out_sz == 0u))
+    {
+        return;
+    }
+
+    if (volt_x10 == 0xFFu)
+    {
+        (void)snprintf(out, out_sz, "NA");
+        return;
+    }
+
+    (void)snprintf(out, out_sz, "%u.%u",
+                   (unsigned)(volt_x10 / 10u),
+                   (unsigned)(volt_x10 % 10u));
+}
+
 static bool prv_get_setting_value_unit(uint8_t* out_value, char* out_unit)
 {
     const UI_Config_t* cfg = UI_GetConfig();
@@ -1592,59 +1644,81 @@ static size_t prv_build_snapshot_payload(const GW_HourRec_t* rec, char* out, siz
     UI_DateTime_t dt;
     size_t len = 0u;
     uint32_t i;
-    uint8_t valid_cnt;
-    bool truncated = false;
-    char set0, set1, set2;
+    uint32_t max_nodes;
+    char gw_vbuf[16];
+    char gw_tbuf[16];
+    char setbuf[8];
+    const char* loc;
 
-    if ((rec == NULL) || (out == NULL) || (out_sz < 64u))
+    if ((rec == NULL) || (out == NULL) || (out_sz < 128u) || (cfg == NULL))
     {
         return 0u;
     }
 
     out[0] = '\0';
     UI_Time_Epoch2016_ToCalendar(prv_get_payload_timestamp_epoch_sec(rec->epoch_sec), &dt);
-    valid_cnt = prv_valid_node_count(rec);
-    set0 = (char)cfg->setting_ascii[0];
-    set1 = (char)cfg->setting_ascii[1];
-    set2 = (char)cfg->setting_ascii[2];
 
+    prv_fmt_volt_x10_ascii(gw_vbuf, sizeof(gw_vbuf), rec->gw_volt_x10);
+    prv_fmt_temp_c_ascii(gw_tbuf, sizeof(gw_tbuf), rec->gw_temp_c);
+
+    setbuf[0] = (char)cfg->setting_ascii[0];
+    setbuf[1] = (char)cfg->setting_ascii[1];
+    setbuf[2] = (char)cfg->setting_ascii[2];
+    setbuf[3] = '\0';
+
+    loc = (cfg->loc_ascii[0] != '\0') ? cfg->loc_ascii : "NA";
+
+    max_nodes = cfg->max_nodes;
+    if (max_nodes < 1u)
+    {
+        max_nodes = 1u;
+    }
+    if (max_nodes > UI_MAX_NODES)
+    {
+        max_nodes = UI_MAX_NODES;
+    }
+
+    /* 요구 포맷:
+     * 날짜,NETID,LOC,SET,전압,온도 + 노드 * ND CNT
+     * DATA 문자열 삭제
+     */
     prv_append_fmt(out, out_sz, &len,
-                   "DATA,GW:%u,NETID:%.*s,SET:%c%c%c,T:%04u-%02u-%02u %02u:%02u:%02u,GV:%u,GT:%d,N:%u\r\n",
-                   (unsigned)cfg->gw_num,
-                   (int)UI_NET_ID_LEN,
-                   (const char*)cfg->net_id,
-                   set0,
-                   set1,
-                   set2,
+                   "%04u-%02u-%02u %02u:%02u:%02u,%.*s,%s,%s,%s,%s",
                    (unsigned)dt.year,
                    (unsigned)dt.month,
                    (unsigned)dt.day,
                    (unsigned)dt.hour,
                    (unsigned)dt.min,
                    (unsigned)dt.sec,
-                   (unsigned)rec->gw_volt_x10,
-                   (int)rec->gw_temp_c,
-                   (unsigned)valid_cnt);
+                   (int)UI_NET_ID_LEN,
+                   (const char*)cfg->net_id,
+                   loc,
+                   setbuf,
+                   gw_vbuf,
+                   gw_tbuf);
 
-    for (i = 0u; i < UI_MAX_NODES; i++)
+    for (i = 0u; i < max_nodes; i++)
     {
         const GW_NodeRec_t* r = &rec->nodes[i];
+        char bbuf[8];
+        char tbuf[8];
+
         if (!prv_node_valid(r))
         {
+            prv_append_fmt(out, out_sz, &len,
+                           ",ND%02lu:NA,NA,NA,NA,NA,NA,NA",
+                           (unsigned long)i);
             continue;
         }
 
-        if ((out_sz - len) < 96u)
-        {
-            truncated = true;
-            break;
-        }
+        prv_fmt_batt_yn(bbuf, sizeof(bbuf), r->batt_lvl);
+        prv_fmt_temp_c_ascii(tbuf, sizeof(tbuf), r->temp_c);
 
         prv_append_fmt(out, out_sz, &len,
-                       "ND:%02lu,B:%u,T:%d,X:%d,Y:%d,Z:%d,A:%u,P:%lu\r\n",
+                       ",ND%02lu:%s,%s,%d,%d,%d,%u,%lu",
                        (unsigned long)i,
-                       (unsigned)r->batt_lvl,
-                       (int)r->temp_c,
+                       bbuf,
+                       tbuf,
                        (int)r->x,
                        (int)r->y,
                        (int)r->z,
@@ -1652,11 +1726,7 @@ static size_t prv_build_snapshot_payload(const GW_HourRec_t* rec, char* out, siz
                        (unsigned long)r->pulse_cnt);
     }
 
-    if (truncated)
-    {
-        prv_append_fmt(out, out_sz, &len, "TRUNC:1\r\n");
-    }
-
+    prv_append_fmt(out, out_sz, &len, "\r\n");
     return len;
 }
 

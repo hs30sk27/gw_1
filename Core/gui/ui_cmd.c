@@ -130,8 +130,8 @@ static void prv_send_setting_read(void)
     (void)snprintf(line, sizeof(line), "NETID:%s\r\n", netid);
     UI_UART_SendString(line);
 
-    /* GW에서는 ND NUM을 노드 개수(1..50) 의미로 사용 */
-    (void)snprintf(line, sizeof(line), "ND NUM:%u\r\n", cfg->max_nodes);
+    /* GW에서는 ND CNT를 노드 개수(1..50) 의미로 사용 */
+    (void)snprintf(line, sizeof(line), "ND CNT:%u\r\n", cfg->max_nodes);
     UI_UART_SendString(line);
 
     /* GW 번호(0..2)도 같이 확인 가능하도록 출력 */
@@ -273,10 +273,10 @@ void UI_Cmd_ProcessLine(const char* line_in)
         return;
     }
 
-    /* -------------------- ND NUM:xx / GW ND NUM:xx ------ */
-    if ((strncmp(p, "ND NUM:", 7) == 0) || (strncmp(p, "GW ND NUM:", 10) == 0))
+    /* -------------------- ND CNT:xx / GW ND CNT:xx ------ */
+    if ((strncmp(p, "ND CNT:", 7) == 0) || (strncmp(p, "GW ND CNT:", 10) == 0))
     {
-        const char* q = (strncmp(p, "GW ND NUM:", 10) == 0) ? (p + 10) : (p + 7);
+        const char* q = (strncmp(p, "GW ND CNT:", 10) == 0) ? (p + 10) : (p + 7);
         uint8_t v = 0;
         if (prv_parse_u8_dec(q, &v) <= 0)
         {
@@ -284,7 +284,7 @@ void UI_Cmd_ProcessLine(const char* line_in)
             return;
         }
 
-        /* GW: ND NUM:xx = 수신할 노드 개수 (1..50) */
+        /* GW: ND CNT:xx = 수신/전송에 포함할 노드 개수 (1..50) */
         if ((v >= 1u) && (v <= UI_MAX_NODES))
         {
             UI_SetMaxNodes(v);
@@ -302,13 +302,13 @@ void UI_Cmd_ProcessLine(const char* line_in)
     {
         const char* q = p + 8;
         uint8_t v = 0;
-        int n = prv_parse_u8_dec(q, &v);
-        if (n <= 0)
+        int n2 = prv_parse_u8_dec(q, &v);
+        if (n2 <= 0)
         {
             prv_send_error();
             return;
         }
-        q += n;
+        q += n2;
         char unit = *q;
         if ((unit != 'M') && (unit != 'H'))
         {
