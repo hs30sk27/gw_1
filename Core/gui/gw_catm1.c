@@ -20,6 +20,7 @@ static uint8_t s_catm1_rb_mem[UI_CATM1_RX_RING_SIZE];
 static UI_RingBuf_t s_catm1_rb;
 static bool s_catm1_rb_ready = false;
 static volatile uint32_t s_catm1_last_rx_ms = 0u;
+static volatile uint32_t s_catm1_last_poweroff_ms = 0u;
 static int64_t s_time_sync_delta_sec_buf[GW_CATM1_TIME_SYNC_DELTA_BUF_LEN];
 static uint8_t s_time_sync_delta_wr = 0u;
 static uint8_t s_time_sync_delta_count = 0u;
@@ -86,6 +87,15 @@ static uint8_t s_time_sync_delta_count = 0u;
 #endif
 #ifndef GW_CATM1_POST_SMS_READY_RETRY_GAP_MS
 #define GW_CATM1_POST_SMS_READY_RETRY_GAP_MS (300u)
+#endif
+#ifndef GW_CATM1_POWER_CYCLE_GUARD_MS
+#define GW_CATM1_POWER_CYCLE_GUARD_MS (2000u)
+#endif
+#ifndef GW_CATM1_SESSION_RESYNC_QUIET_MS
+#define GW_CATM1_SESSION_RESYNC_QUIET_MS (200u)
+#endif
+#ifndef GW_CATM1_SESSION_RESYNC_MAX_WAIT_MS
+#define GW_CATM1_SESSION_RESYNC_MAX_WAIT_MS (1200u)
 #endif
 
 #ifndef GW_TCP_INTERNAL_TEMP_COMP_C
@@ -206,6 +216,7 @@ static bool prv_wait_eps_registered(void);
 static bool prv_wait_eps_registered_until(uint32_t timeout_ms);
 static bool prv_wait_ps_attached(void);
 static bool prv_wait_ps_attached_until(uint32_t timeout_ms);
+static bool prv_try_session_resync(void);
 
 static void prv_catm1_rb_reset(void)
 {
@@ -618,6 +629,13 @@ static bool prv_wait_boot_sms_ready(void)
     return prv_uart_wait_for(rsp, sizeof(rsp), GW_CATM1_BOOT_URC_WAIT_MS, "SMS Ready", NULL, NULL);
 }
 
+static bool prv_try_session_resync(void)
+{
+    prv_wait_rx_quiet(GW_CATM1_SESSION_RESYNC_QUIET_MS,
+                      GW_CATM1_SESSION_RESYNC_MAX_WAIT_MS);
+    return prv_send_at_sync();
+}
+
 static bool prv_wait_at_sync_after_sms_ready(void)
 {
     uint32_t start = HAL_GetTick();
@@ -663,15 +681,20 @@ static bool prv_start_session(bool enable_time_auto_update)
     bool cpin_ready = false;
 
     prv_uart_flush_rx();
-    GW_Catm1_PowerOn();
-    prv_delay_ms(UI_CATM1_BOOT_WAIT_MS);
     s_catm1_session_at_ok = false;
 
-    if (!prv_wait_boot_sms_ready()) {
-        return false;
-    }
-    if (!prv_wait_at_sync_after_sms_ready()) {
-        return false;
+    /* 모뎀이 이미 켜져 있고 AT 응답이 살아 있으면 불필요한 재부팅을 하지 않는다. */
+    if (!prv_send_at_sync()) {
+        GW_Catm1_PowerOn();
+        prv_delay_ms(UI_CATM1_BOOT_WAIT_MS);
+        s_catm1_session_at_ok = false;
+
+        if (!prv_wait_boot_sms_ready()) {
+            return false;
+        }
+        if (!prv_wait_at_sync_after_sms_ready()) {
+            return false;
+        }
     }
 
     rsp[0] = '\0';
@@ -807,6 +830,7 @@ static bool prv_query_network_time_epoch_retry(uint32_t max_try, uint32_t gap_ms
         uint32_t query_start_ms = HAL_GetTick();
 
         if (!prv_send_query_wait_prefix_ok("AT+CCLK?\r\n", "+CCLK:", UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp))) {
+            (void)prv_try_session_resync();
             if ((i + 1u) < max_try) {
                 prv_delay_ms(gap_ms);
             }
@@ -1011,6 +1035,8 @@ static bool prv_wait_eps_registered_until(uint32_t timeout_ms)
             if ((stat == 3u) || (stat == 6u) || (stat == 7u) || (stat == 8u)) {
                 return false;
             }
+        } else {
+            (void)prv_try_session_resync();
         }
         prv_delay_ms(UI_CATM1_NET_REG_POLL_MS);
     }
@@ -1056,6 +1082,8 @@ static bool prv_wait_ps_attached_until(uint32_t timeout_ms)
             if (state == 1u) {
                 return true;
             }
+        } else {
+            (void)prv_try_session_resync();
         }
         prv_delay_ms(UI_CATM1_PS_ATTACH_POLL_MS);
     }
@@ -1442,7 +1470,15 @@ void GW_Catm1_Init(void)
 
 void GW_Catm1_PowerOn(void)
 {
+    uint32_t now = HAL_GetTick();
     s_catm1_session_at_ok = false;
+
+    if (s_catm1_last_poweroff_ms != 0u) {
+        uint32_t elapsed = (uint32_t)(now - s_catm1_last_poweroff_ms);
+        if (elapsed < GW_CATM1_POWER_CYCLE_GUARD_MS) {
+            prv_delay_ms(GW_CATM1_POWER_CYCLE_GUARD_MS - elapsed);
+        }
+    }
 #if defined(PWR_KEY_Pin)
     HAL_GPIO_WritePin(PWR_KEY_GPIO_Port, PWR_KEY_Pin, UI_CATM1_PWRKEY_INACTIVE_STATE);
 #endif
@@ -1483,6 +1519,7 @@ void GW_Catm1_PowerOff(void)
 #if defined(CATM1_PWR_Pin)
     HAL_GPIO_WritePin(CATM1_PWR_GPIO_Port, CATM1_PWR_Pin, GPIO_PIN_RESET);
 #endif
+    s_catm1_last_poweroff_ms = HAL_GetTick();
 }
 
 bool GW_Catm1_IsBusy(void)
