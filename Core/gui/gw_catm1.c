@@ -1369,7 +1369,7 @@ static size_t prv_build_snapshot_payload(const GW_HourRec_t* rec, char* out, siz
     gw_temp_c = (int)prv_apply_tcp_temp_comp_c(rec->gw_temp_c);
 
     prv_append_fmt(out, out_sz, &len,
-                   "TIME:%s,NETID:%.*s,GW:%u,LOC:%s,SET:%c%c%c,GV:%c,GT:%d\r\n",
+                   "T:%s,NID:%.*s,GW:%u,L:%s,S:%c%c%c,GV:%c,GT:%d\r\n",
                    ts_buf,
                    (int)UI_NET_ID_LEN,
                    (const char*)cfg->net_id,
@@ -1395,7 +1395,7 @@ static size_t prv_build_snapshot_payload(const GW_HourRec_t* rec, char* out, siz
         node_volt_flag = prv_node_voltage_flag(r->batt_lvl);
         node_temp_c = (int)r->temp_c;
         prv_append_fmt(out, out_sz, &len,
-                       "NODE:%02lu,V:%c,T:%d,X:%d,Y:%d,Z:%d,ADC_VALUE:%u,PULSE_COUNT:%lu\r\n",
+                       "ND:%02lu,V:%c,T:%d,X:%d,Y:%d,Z:%d,A:%u,P:%lu\r\n",
                        (unsigned long)i,
                        node_volt_flag,
                        node_temp_c,
