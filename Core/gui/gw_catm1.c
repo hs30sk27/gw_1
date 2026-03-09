@@ -679,15 +679,21 @@ static bool prv_start_session(bool enable_time_auto_update)
 {
     char rsp[UI_CATM1_RX_BUF_SZ];
     bool cpin_ready = false;
+    bool reuse_live_session = false;
 
     prv_uart_flush_rx();
-    s_catm1_session_at_ok = false;
 
-    /* 모뎀이 이미 켜져 있고 AT 응답이 살아 있으면 불필요한 재부팅을 하지 않는다. */
-    if (!prv_send_at_sync()) {
+    /* 이미 살아 있는 세션에서만 AT resync를 시도한다.
+     * power-on 직후 session_at_ok가 없는 상태에서는 SMS Ready 이전에
+     * AT/CTZU/CEREG/CGATT를 보내지 않는다. */
+    if (s_catm1_session_at_ok) {
+        reuse_live_session = prv_try_session_resync();
+    }
+
+    if (!reuse_live_session) {
+        s_catm1_session_at_ok = false;
         GW_Catm1_PowerOn();
         prv_delay_ms(UI_CATM1_BOOT_WAIT_MS);
-        s_catm1_session_at_ok = false;
 
         if (!prv_wait_boot_sms_ready()) {
             return false;
@@ -703,18 +709,23 @@ static bool prv_start_session(bool enable_time_auto_update)
         cpin_ready = true;
     }
 
-    if (enable_time_auto_update) {
-        prv_enable_network_time_auto_update();
-    }
-    (void)prv_send_query_wait_prefix_ok("AT+CEREG?\r\n", "+CEREG:", UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
-    (void)prv_send_query_wait_prefix_ok("AT+CGATT?\r\n", "+CGATT:", UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
-
     if (!cpin_ready) {
         cpin_ready = prv_wait_sim_ready();
     }
     if (!cpin_ready) {
         return false;
     }
+
+    prv_wait_rx_quiet(200u, 1200u);
+
+    if (enable_time_auto_update) {
+        prv_enable_network_time_auto_update();
+        prv_wait_rx_quiet(100u, 600u);
+    }
+
+    rsp[0] = '\0';
+    (void)prv_send_query_wait_prefix_ok("AT+CEREG?\r\n", "+CEREG:", UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
+    (void)prv_send_query_wait_prefix_ok("AT+CGATT?\r\n", "+CGATT:", UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
 
     prv_wait_rx_quiet(200u, 1200u);
     return true;
@@ -1519,6 +1530,7 @@ void GW_Catm1_PowerOff(void)
 #if defined(CATM1_PWR_Pin)
     HAL_GPIO_WritePin(CATM1_PWR_GPIO_Port, CATM1_PWR_Pin, GPIO_PIN_RESET);
 #endif
+    s_catm1_session_at_ok = false;
     s_catm1_last_poweroff_ms = HAL_GetTick();
 }
 
