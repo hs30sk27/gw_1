@@ -108,6 +108,18 @@ static uint8_t s_failed_snapshot_queued_gw_num = 0u;
 #ifndef GW_CATM1_SESSION_RESYNC_MAX_WAIT_MS
 #define GW_CATM1_SESSION_RESYNC_MAX_WAIT_MS (1200u)
 #endif
+#ifndef GW_CATM1_NET_REG_MIN_TIMEOUT_MS
+#define GW_CATM1_NET_REG_MIN_TIMEOUT_MS (60000u)
+#endif
+#ifndef GW_CATM1_PS_ATTACH_MIN_TIMEOUT_MS
+#define GW_CATM1_PS_ATTACH_MIN_TIMEOUT_MS (30000u)
+#endif
+#ifndef GW_CATM1_QUERY_FAIL_RESYNC_STREAK
+#define GW_CATM1_QUERY_FAIL_RESYNC_STREAK (3u)
+#endif
+#ifndef GW_CATM1_POST_CPIN_NETWORK_SETTLE_MS
+#define GW_CATM1_POST_CPIN_NETWORK_SETTLE_MS (1500u)
+#endif
 
 #ifndef GW_TCP_INTERNAL_TEMP_COMP_C
 #define GW_TCP_INTERNAL_TEMP_COMP_C ((int8_t)-4)
@@ -732,11 +744,19 @@ static bool prv_start_session(bool enable_time_auto_update)
         return false;
     }
 
+    /* CPIN READY 직후에는 NAS/attach가 아직 흔들릴 수 있어 바로 CTZU/CEREG를 쏘지 않고
+     * 잠깐 안정 시간을 둔다. */
     prv_wait_rx_quiet(200u, 1200u);
+    prv_delay_ms(GW_CATM1_POST_CPIN_NETWORK_SETTLE_MS);
 
+    /* 등록 상태 변화 URC는 best-effort로 켜 두되, 실패해도 세션은 계속 진행한다. */
+    rsp[0] = '\0';
+    (void)prv_send_cmd_wait("AT+CEREG=2\r\n", "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
+
+    /* CTZU/CLTS는 등록 직전 단계에서 URC를 쏟아 query를 흔들 수 있어
+     * 실제 시간 동기화 경로(prv_sync_time_from_modem_startup)로 defer 한다. */
     if (enable_time_auto_update) {
-        prv_enable_network_time_auto_update();
-        prv_wait_rx_quiet(100u, 600u);
+        prv_wait_rx_quiet(100u, 400u);
     }
 
     rsp[0] = '\0';
@@ -1052,18 +1072,33 @@ static bool prv_wait_eps_registered_until(uint32_t timeout_ms)
     char rsp[UI_CATM1_RX_BUF_SZ];
     uint8_t stat = 0u;
     uint32_t start = HAL_GetTick();
+    uint32_t effective_timeout_ms = timeout_ms;
+    uint8_t query_fail_streak = 0u;
 
-    while ((uint32_t)(HAL_GetTick() - start) < timeout_ms) {
+    if (effective_timeout_ms < GW_CATM1_NET_REG_MIN_TIMEOUT_MS) {
+        effective_timeout_ms = GW_CATM1_NET_REG_MIN_TIMEOUT_MS;
+    }
+
+    while ((uint32_t)(HAL_GetTick() - start) < effective_timeout_ms) {
         if (prv_send_query_wait_prefix_ok("AT+CEREG?\r\n", "+CEREG:", UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp)) &&
             prv_parse_cereg_stat(rsp, &stat)) {
+            query_fail_streak = 0u;
+
             if ((stat == 1u) || (stat == 5u) || (stat == 9u) || (stat == 10u)) {
                 return true;
             }
-            if ((stat == 3u) || (stat == 6u) || (stat == 7u) || (stat == 8u)) {
-                return false;
-            }
+
+            /* 0/2는 미등록/검색중, 6/7/8은 SMS only/emergency 상태라 데이터는 아직 불가하지만
+             * 실제 현장에서는 잠시 후 5로 올라가는 경우가 있어 즉시 실패로 보지 않는다.
+             * 3/4도 세션을 바로 끊지 않고 timeout까지 기다렸다가 판단한다. */
         } else {
-            (void)prv_try_session_resync();
+            query_fail_streak++;
+            if (query_fail_streak >= GW_CATM1_QUERY_FAIL_RESYNC_STREAK) {
+                (void)prv_try_session_resync();
+                query_fail_streak = 0u;
+            } else {
+                prv_wait_rx_quiet(150u, 700u);
+            }
         }
         prv_delay_ms(UI_CATM1_NET_REG_POLL_MS);
     }
@@ -1102,15 +1137,28 @@ static bool prv_wait_ps_attached_until(uint32_t timeout_ms)
     char rsp[UI_CATM1_RX_BUF_SZ];
     uint8_t state = 0u;
     uint32_t start = HAL_GetTick();
+    uint32_t effective_timeout_ms = timeout_ms;
+    uint8_t query_fail_streak = 0u;
 
-    while ((uint32_t)(HAL_GetTick() - start) < timeout_ms) {
+    if (effective_timeout_ms < GW_CATM1_PS_ATTACH_MIN_TIMEOUT_MS) {
+        effective_timeout_ms = GW_CATM1_PS_ATTACH_MIN_TIMEOUT_MS;
+    }
+
+    while ((uint32_t)(HAL_GetTick() - start) < effective_timeout_ms) {
         if (prv_send_query_wait_prefix_ok("AT+CGATT?\r\n", "+CGATT:", UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp)) &&
             prv_parse_cgatt_state(rsp, &state)) {
+            query_fail_streak = 0u;
             if (state == 1u) {
                 return true;
             }
         } else {
-            (void)prv_try_session_resync();
+            query_fail_streak++;
+            if (query_fail_streak >= GW_CATM1_QUERY_FAIL_RESYNC_STREAK) {
+                (void)prv_try_session_resync();
+                query_fail_streak = 0u;
+            } else {
+                prv_wait_rx_quiet(150u, 700u);
+            }
         }
         prv_delay_ms(UI_CATM1_PS_ATTACH_POLL_MS);
     }
