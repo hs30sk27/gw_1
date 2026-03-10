@@ -1471,10 +1471,42 @@ static uint32_t prv_get_snapshot_node_limit(void)
     return limit;
 }
 
+static bool prv_is_ascii_space(char ch)
+{
+    return (ch == ' ') || (ch == '\t') || (ch == '\r') || (ch == '\n');
+}
+
+static void prv_trim_ascii_inplace(char* s)
+{
+    size_t start = 0u;
+    size_t len;
+
+    if (s == NULL) {
+        return;
+    }
+
+    while (prv_is_ascii_space(s[start])) {
+        start++;
+    }
+
+    if (start > 0u) {
+        memmove(s, &s[start], strlen(&s[start]) + 1u);
+    }
+
+    len = strlen(s);
+    while ((len > 0u) && prv_is_ascii_space(s[len - 1u])) {
+        s[len - 1u] = '\0';
+        len--;
+    }
+}
+
 static void prv_get_loc_ascii_safe(char* out, size_t out_sz)
 {
     const char* src;
-    size_t i = 0u;
+    char tmp[192];
+    size_t si = 0u;
+    size_t di = 0u;
+    char* sep = NULL;
 
     if ((out == NULL) || (out_sz == 0u)) {
         return;
@@ -1486,18 +1518,66 @@ static void prv_get_loc_ascii_safe(char* out, size_t out_sz)
         return;
     }
 
-    while ((src[i] != '\0') && ((i + 1u) < out_sz)) {
-        char ch = src[i];
+    while ((src[si] != '\0') && ((di + 1u) < sizeof(tmp))) {
+        char ch = src[si++];
 
         if ((ch == '\r') || (ch == '\n')) {
             ch = ' ';
-        } else if (ch == ',') {
+        }
+        tmp[di++] = ch;
+    }
+    tmp[di] = '\0';
+    prv_trim_ascii_inplace(tmp);
+
+    if (tmp[0] == '\0') {
+        (void)snprintf(out, out_sz, "-");
+        return;
+    }
+
+    if ((tmp[0] == '(') && (tmp[strlen(tmp) - 1u] == ')')) {
+        (void)snprintf(out, out_sz, "%s", tmp);
+        return;
+    }
+
+    sep = strchr(tmp, ';');
+    if (sep == NULL) {
+        sep = strchr(tmp, ',');
+    }
+
+    if ((sep != NULL) &&
+        (strchr(sep + 1, ';') == NULL) &&
+        (strchr(sep + 1, ',') == NULL)) {
+        char left[96];
+        char right[96];
+        size_t left_len = (size_t)(sep - tmp);
+
+        memset(left, 0, sizeof(left));
+        memset(right, 0, sizeof(right));
+        if (left_len >= sizeof(left)) {
+            left_len = sizeof(left) - 1u;
+        }
+        memcpy(left, tmp, left_len);
+        left[left_len] = '\0';
+        (void)snprintf(right, sizeof(right), "%s", sep + 1);
+        prv_trim_ascii_inplace(left);
+        prv_trim_ascii_inplace(right);
+
+        if ((left[0] != '\0') && (right[0] != '\0')) {
+            (void)snprintf(out, out_sz, "(%s,%s)", left, right);
+            return;
+        }
+    }
+
+    di = 0u;
+    for (si = 0u; (tmp[si] != '\0') && ((di + 1u) < out_sz); si++) {
+        char ch = tmp[si];
+
+        if (ch == ',') {
             ch = ';';
         }
-        out[i] = ch;
-        i++;
+        out[di++] = ch;
     }
-    out[i] = '\0';
+    out[di] = '\0';
 
     if (out[0] == '\0') {
         (void)snprintf(out, out_sz, "-");
@@ -1556,7 +1636,7 @@ static size_t prv_build_snapshot_payload(const GW_HourRec_t* rec, char* out, siz
     gw_temp_c = (int)prv_apply_tcp_temp_comp_c(rec->gw_temp_c);
 
     prv_append_fmt(out, out_sz, &len,
-                   "T:%s,NID:%.*s,GW:%u,L:%s,S:%c%c%c,GV:%c,GT:%d\r\n",
+                   "T:%s,NID:%.*s,GW:%u,L:%s,S:%c%c%c,GV:%c,GT:%d",
                    ts_buf,
                    (int)UI_NET_ID_LEN,
                    (const char*)cfg->net_id,
@@ -1582,7 +1662,7 @@ static size_t prv_build_snapshot_payload(const GW_HourRec_t* rec, char* out, siz
         node_volt_flag = prv_node_voltage_flag(r->batt_lvl);
         node_temp_c = (int)r->temp_c;
         prv_append_fmt(out, out_sz, &len,
-                       "ND:%02lu,V:%c,T:%d,X:%d,Y:%d,Z:%d,A:%u,P:%lu\r\n",
+                       ",ND:%02lu,V:%c,T:%d,X:%d,Y:%d,Z:%d,A:%u,P:%lu",
                        (unsigned long)i,
                        node_volt_flag,
                        node_temp_c,
@@ -1593,8 +1673,9 @@ static size_t prv_build_snapshot_payload(const GW_HourRec_t* rec, char* out, siz
                        (unsigned long)r->pulse_cnt);
     }
     if (truncated) {
-        prv_append_fmt(out, out_sz, &len, "TRUNC:1\r\n");
+        prv_append_fmt(out, out_sz, &len, ",TRUNC:1");
     }
+    prv_append_fmt(out, out_sz, &len, "\r\n");
     return len;
 }
 
