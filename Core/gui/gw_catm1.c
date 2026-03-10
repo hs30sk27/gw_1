@@ -23,8 +23,10 @@ static UI_RingBuf_t s_catm1_rb;
 static bool s_catm1_rb_ready = false;
 static volatile uint32_t s_catm1_last_rx_ms = 0u;
 static volatile uint32_t s_catm1_last_poweroff_ms = 0u;
+static volatile uint32_t s_catm1_last_caopen_ms = 0u;
 static volatile bool s_catm1_waiting_boot_sms_ready = false;
 static volatile bool s_catm1_boot_sms_ready_seen = false;
+static volatile bool s_catm1_tcp_open_fail_powerdown_pending = false;
 static int64_t s_time_sync_delta_sec_buf[GW_CATM1_TIME_SYNC_DELTA_BUF_LEN];
 static uint8_t s_time_sync_delta_wr = 0u;
 static uint8_t s_time_sync_delta_count = 0u;
@@ -89,6 +91,18 @@ static uint8_t s_failed_snapshot_queued_gw_num = 0u;
 #endif
 #ifndef GW_CATM1_TCP_OPEN_SUCCESS_URC_TIMEOUT_MS
 #define GW_CATM1_TCP_OPEN_SUCCESS_URC_TIMEOUT_MS (2000u)
+#endif
+#ifndef GW_CATM1_TCP_OPEN_FAIL_CPOWD_DELAY_MS
+#define GW_CATM1_TCP_OPEN_FAIL_CPOWD_DELAY_MS (2000u)
+#endif
+#ifndef GW_CATM1_TCP_OPEN_FAIL_PWRDOWN_TIMEOUT_MS
+#define GW_CATM1_TCP_OPEN_FAIL_PWRDOWN_TIMEOUT_MS (2000u)
+#endif
+#ifndef GW_CATM1_TCP_OPEN_FAIL_PWRDOWN_WAIT_MS
+#define GW_CATM1_TCP_OPEN_FAIL_PWRDOWN_WAIT_MS (1000u)
+#endif
+#ifndef GW_CATM1_TCP_OPEN_FAIL_CPOWD_POST_TX_HOLD_MS
+#define GW_CATM1_TCP_OPEN_FAIL_CPOWD_POST_TX_HOLD_MS (150u)
 #endif
 #ifndef GW_CATM1_CCLK_QUERY_COMP_MAX_CENTI
 #define GW_CATM1_CCLK_QUERY_COMP_MAX_CENTI (250u)
@@ -1265,6 +1279,22 @@ static bool prv_parse_caopen_result(const char* rsp, uint8_t* out_cid, uint8_t* 
     return false;
 }
 
+static void prv_mark_tcp_open_failure(uint32_t caopen_ms)
+{
+    s_catm1_last_caopen_ms = caopen_ms;
+    s_catm1_tcp_open_fail_powerdown_pending = true;
+}
+
+static void prv_finish_power_off_state(void)
+{
+    s_catm1_session_at_ok = false;
+    s_catm1_boot_sms_ready_seen = false;
+    s_catm1_waiting_boot_sms_ready = false;
+    s_catm1_tcp_open_fail_powerdown_pending = false;
+    s_catm1_last_caopen_ms = 0u;
+    s_catm1_last_poweroff_ms = HAL_GetTick();
+}
+
 static bool prv_open_tcp(const uint8_t ip[4], uint16_t port)
 {
     char cmd[96];
@@ -1275,6 +1305,9 @@ static bool prv_open_tcp(const uint8_t ip[4], uint16_t port)
     uint32_t start;
     uint32_t timeout_ms = GW_CATM1_TCP_OPEN_SUCCESS_URC_TIMEOUT_MS;
     size_t n = 0u;
+
+    s_catm1_tcp_open_fail_powerdown_pending = false;
+    s_catm1_last_caopen_ms = 0u;
 
     if ((timeout_ms == 0u) || (timeout_ms > GW_CATM1_TCP_OPEN_HARD_TIMEOUT_MS)) {
         timeout_ms = GW_CATM1_TCP_OPEN_HARD_TIMEOUT_MS;
@@ -1297,6 +1330,7 @@ static bool prv_open_tcp(const uint8_t ip[4], uint16_t port)
 
     rsp[0] = '\0';
     start = HAL_GetTick();
+    s_catm1_last_caopen_ms = start;
     while ((uint32_t)(HAL_GetTick() - start) < timeout_ms) {
         if (!prv_catm1_rb_pop_wait(&ch, 20u)) {
             continue;
@@ -1317,20 +1351,25 @@ static bool prv_open_tcp(const uint8_t ip[4], uint16_t port)
         }
 
         if ((strstr(rsp, "ERROR") != NULL) || (strstr(rsp, "+CME ERROR") != NULL)) {
-            /* caller cleanup에서 즉시 power down 처리 */
+            /* CAOPEN 실패 cleanup에서 2초 기준으로 빠른 power down 처리 */
+            prv_mark_tcp_open_failure(start);
             return false;
         }
 
         if (prv_parse_caopen_result(rsp, &cid, &result) && (cid == 0u)) {
             if (result == 0u) {
+                s_catm1_last_caopen_ms = 0u;
+                s_catm1_tcp_open_fail_powerdown_pending = false;
                 return true;
             }
-            /* +CAOPEN: 0,0 이 아니면 즉시 전송 취소 후 power down */
+            /* +CAOPEN: 0,0 이 아니면 cleanup에서 2초 기준으로 빠른 power down */
+            prv_mark_tcp_open_failure(start);
             return false;
         }
     }
 
-    /* +CAOPEN: 0,0 이 2초 안에 없으면 caller cleanup에서 power down */
+    /* +CAOPEN: 0,0 이 2초 안에 없으면 cleanup에서 즉시 CPOWD 경로로 전환 */
+    prv_mark_tcp_open_failure(start);
     return false;
 }
 
@@ -1711,6 +1750,8 @@ void GW_Catm1_Init(void)
     s_catm1_session_at_ok = false;
     s_catm1_boot_sms_ready_seen = false;
     s_catm1_waiting_boot_sms_ready = false;
+    s_catm1_tcp_open_fail_powerdown_pending = false;
+    s_catm1_last_caopen_ms = 0u;
     prv_power_leds_blink_twice();
 }
 
@@ -1720,6 +1761,8 @@ void GW_Catm1_PowerOn(void)
     s_catm1_session_at_ok = false;
     s_catm1_boot_sms_ready_seen = false;
     s_catm1_waiting_boot_sms_ready = true;
+    s_catm1_tcp_open_fail_powerdown_pending = false;
+    s_catm1_last_caopen_ms = 0u;
 
     if (s_catm1_last_poweroff_ms != 0u) {
         uint32_t elapsed = (uint32_t)(now - s_catm1_last_poweroff_ms);
@@ -1745,15 +1788,47 @@ void GW_Catm1_PowerOff(void)
 {
     char rsp[UI_CATM1_RX_BUF_SZ];
     bool normal_pd = false;
+    bool fast_pd = s_catm1_tcp_open_fail_powerdown_pending;
+    uint32_t pd_timeout_ms = UI_CATM1_PWRDOWN_TIMEOUT_MS;
+    uint32_t pd_wait_ms = UI_CATM1_PWRDOWN_WAIT_MS;
+
+    if (fast_pd) {
+        uint32_t elapsed = 0u;
+
+        if (s_catm1_last_caopen_ms != 0u) {
+            elapsed = (uint32_t)(HAL_GetTick() - s_catm1_last_caopen_ms);
+        }
+        if (elapsed < GW_CATM1_TCP_OPEN_FAIL_CPOWD_DELAY_MS) {
+            prv_delay_ms(GW_CATM1_TCP_OPEN_FAIL_CPOWD_DELAY_MS - elapsed);
+        }
+
+#if defined(PWR_KEY_Pin)
+        HAL_GPIO_WritePin(PWR_KEY_GPIO_Port, PWR_KEY_Pin, UI_CATM1_PWRKEY_INACTIVE_STATE);
+#endif
+        if (prv_lpuart_is_inited()) {
+            prv_uart_flush_rx();
+            (void)prv_uart_send_text("AT+CPOWD=1\r\n", UI_CATM1_AT_TIMEOUT_MS);
+            prv_delay_ms(GW_CATM1_TCP_OPEN_FAIL_CPOWD_POST_TX_HOLD_MS);
+        }
+#if defined(CATM1_PWR_Pin)
+        HAL_GPIO_WritePin(CATM1_PWR_GPIO_Port, CATM1_PWR_Pin, GPIO_PIN_RESET);
+#elif defined(PWR_KEY_Pin)
+        HAL_GPIO_WritePin(PWR_KEY_GPIO_Port, PWR_KEY_Pin, UI_CATM1_PWRKEY_ACTIVE_STATE);
+        prv_delay_ms(UI_CATM1_PWRKEY_OFF_PULSE_MS);
+        HAL_GPIO_WritePin(PWR_KEY_GPIO_Port, PWR_KEY_Pin, UI_CATM1_PWRKEY_INACTIVE_STATE);
+#endif
+        prv_finish_power_off_state();
+        return;
+    }
 
 #if defined(PWR_KEY_Pin)
     HAL_GPIO_WritePin(PWR_KEY_GPIO_Port, PWR_KEY_Pin, UI_CATM1_PWRKEY_INACTIVE_STATE);
 #endif
     if (prv_lpuart_is_inited() && s_catm1_session_at_ok) {
         if (prv_send_cmd_wait("AT+CPOWD=1\r\n", "NORMAL POWER DOWN", "OK", NULL,
-                              UI_CATM1_PWRDOWN_TIMEOUT_MS, rsp, sizeof(rsp))) {
+                              pd_timeout_ms, rsp, sizeof(rsp))) {
             normal_pd = true;
-            prv_delay_ms(UI_CATM1_PWRDOWN_WAIT_MS);
+            prv_delay_ms(pd_wait_ms);
         }
     }
 #if defined(PWR_KEY_Pin)
@@ -1761,16 +1836,13 @@ void GW_Catm1_PowerOff(void)
         HAL_GPIO_WritePin(PWR_KEY_GPIO_Port, PWR_KEY_Pin, UI_CATM1_PWRKEY_ACTIVE_STATE);
         prv_delay_ms(UI_CATM1_PWRKEY_OFF_PULSE_MS);
         HAL_GPIO_WritePin(PWR_KEY_GPIO_Port, PWR_KEY_Pin, UI_CATM1_PWRKEY_INACTIVE_STATE);
-        prv_delay_ms(UI_CATM1_PWRDOWN_WAIT_MS);
+        prv_delay_ms(pd_wait_ms);
     }
 #endif
 #if defined(CATM1_PWR_Pin)
     HAL_GPIO_WritePin(CATM1_PWR_GPIO_Port, CATM1_PWR_Pin, GPIO_PIN_RESET);
 #endif
-    s_catm1_session_at_ok = false;
-    s_catm1_boot_sms_ready_seen = false;
-    s_catm1_waiting_boot_sms_ready = false;
-    s_catm1_last_poweroff_ms = HAL_GetTick();
+    prv_finish_power_off_state();
 }
 
 bool GW_Catm1_IsBusy(void)
