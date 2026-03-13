@@ -459,7 +459,11 @@ static uint32_t prv_get_rx_start_offset_sec(void)
     if (prv_is_two_minute_mode_active()) {
         return 30u;
     }
-    return 30u;
+    /* 일반 모드 ND TX base offset은 60초(+ node_num*2초)다.
+     * 최신 코드에서 GW RX 시작을 30초로 당겨 놓으면서,
+     * max_nodes가 작은 경우 GW가 ND00/ND01 전송 전에 RX를 끝내는 문제가 생겼다.
+     * 정상 모드는 설정 매크로(UI_GW_RX_START_OFFSET_S)와 다시 맞춘다. */
+    return UI_GW_RX_START_OFFSET_S;
 }
 
 static bool prv_get_reminder_offset_sec(uint32_t* out_offset_sec)
