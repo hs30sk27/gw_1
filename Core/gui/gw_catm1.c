@@ -32,6 +32,7 @@ static int64_t s_time_sync_delta_sec_buf[GW_CATM1_TIME_SYNC_DELTA_BUF_LEN];
 static uint8_t s_time_sync_delta_wr = 0u;
 static uint8_t s_time_sync_delta_count = 0u;
 static bool s_catm1_time_auto_update_attempted_this_power = false;
+static bool s_catm1_startup_apn_configured_this_power = false;
 
 static bool s_failed_snapshot_queued_valid = false;
 static uint32_t s_failed_snapshot_queued_epoch_sec = 0u;
@@ -154,6 +155,15 @@ static uint8_t s_failed_snapshot_queued_gw_num = 0u;
 #ifndef GW_CATM1_POST_CPIN_NETWORK_SETTLE_MS
 #define GW_CATM1_POST_CPIN_NETWORK_SETTLE_MS (1500u)
 #endif
+#ifndef GW_CATM1_APN_BOOTSTRAP_CFUN_OFF_SETTLE_MS
+#define GW_CATM1_APN_BOOTSTRAP_CFUN_OFF_SETTLE_MS (600u)
+#endif
+#ifndef GW_CATM1_APN_BOOTSTRAP_CFUN_ON_SETTLE_MS
+#define GW_CATM1_APN_BOOTSTRAP_CFUN_ON_SETTLE_MS (1200u)
+#endif
+#ifndef GW_CATM1_APN_BOOTSTRAP_CFUN_TIMEOUT_MS
+#define GW_CATM1_APN_BOOTSTRAP_CFUN_TIMEOUT_MS (5000u)
+#endif
 
 #ifndef GW_TCP_INTERNAL_TEMP_COMP_C
 #define GW_TCP_INTERNAL_TEMP_COMP_C ((int8_t)-4)
@@ -268,6 +278,7 @@ static void prv_format_epoch2016(uint32_t epoch_sec, char* out, size_t out_sz)
 }
 
 static bool prv_activate_pdp(void);
+static bool prv_prepare_apn_before_time_sync(void);
 static void prv_enable_network_time_auto_update(void);
 static bool prv_sync_time_from_modem_startup_try(bool run_time_auto_update_setup,
                                                   bool abort_on_initial_invalid,
@@ -803,6 +814,71 @@ static bool prv_start_session(bool enable_time_auto_update)
     (void)prv_send_query_wait_prefix_ok("AT+CGATT?\r\n", "+CGATT:", UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
 
     prv_wait_rx_quiet(200u, 1200u);
+    return true;
+}
+
+static bool prv_prepare_apn_before_time_sync(void)
+{
+    char rsp[UI_CATM1_RX_BUF_SZ];
+    char cmd[96];
+    bool did_cfun0 = false;
+    bool cpin_ready = false;
+
+    if (s_catm1_startup_apn_configured_this_power) {
+        return true;
+    }
+
+    s_catm1_startup_apn_configured_this_power = true;
+
+    prv_wait_rx_quiet(100u, 500u);
+    rsp[0] = '\0';
+    did_cfun0 = prv_send_cmd_wait("AT+CFUN=0\r\n", "OK", NULL, NULL,
+                                  GW_CATM1_APN_BOOTSTRAP_CFUN_TIMEOUT_MS, rsp, sizeof(rsp));
+    if (did_cfun0) {
+        prv_wait_rx_quiet(100u, GW_CATM1_APN_BOOTSTRAP_CFUN_OFF_SETTLE_MS);
+    }
+
+    (void)snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"\r\n", UI_CATM1_1NCE_APN);
+    rsp[0] = '\0';
+    if (!prv_send_cmd_wait(cmd, "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp))) {
+        return false;
+    }
+
+    prv_wait_rx_quiet(100u, 400u);
+//    (void)snprintf(cmd, sizeof(cmd), "AT+CNCFG=0,1,\"%s\",\"\",\"\",1\r\n", UI_CATM1_1NCE_APN);
+    (void)snprintf(cmd, sizeof(cmd), "AT+CNCFG=0,1,\"%s\",\"\",\"\",0\r\n", UI_CATM1_1NCE_APN);
+    rsp[0] = '\0';
+    if (!prv_send_cmd_wait(cmd, "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp))) {
+        return false;
+    }
+
+    if (did_cfun0) {
+        prv_wait_rx_quiet(100u, 400u);
+        rsp[0] = '\0';
+        if (!prv_send_cmd_wait("AT+CFUN=1\r\n", "OK", NULL, NULL,
+                               GW_CATM1_APN_BOOTSTRAP_CFUN_TIMEOUT_MS, rsp, sizeof(rsp))) {
+            return false;
+        }
+
+        prv_wait_rx_quiet(100u, GW_CATM1_APN_BOOTSTRAP_CFUN_ON_SETTLE_MS);
+        rsp[0] = '\0';
+        if (prv_send_query_wait_prefix_ok("AT+CPIN?\r\n", "+CPIN:", UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp)) &&
+            (strstr(rsp, "+CPIN: READY") != NULL)) {
+            cpin_ready = true;
+        }
+        if (!cpin_ready) {
+            cpin_ready = prv_wait_sim_ready();
+        }
+        if (!cpin_ready) {
+            return false;
+        }
+
+        prv_wait_rx_quiet(200u, 1200u);
+    }
+
+    rsp[0] = '\0';
+    (void)prv_send_cmd_wait("AT+CEREG=2\r\n", "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
+    prv_wait_rx_quiet(100u, 400u);
     return true;
 }
 
@@ -1355,6 +1431,7 @@ static void prv_finish_power_off_state(void)
     s_catm1_tcp_open_fail_powerdown_pending = false;
     s_catm1_last_caopen_ms = 0u;
     s_catm1_time_auto_update_attempted_this_power = false;
+    s_catm1_startup_apn_configured_this_power = false;
     s_catm1_last_poweroff_ms = HAL_GetTick();
 }
 
@@ -2228,6 +2305,15 @@ bool GW_Catm1_SyncTimeOnce(void)
 
 retry_after_power_cycle:
     if (!prv_start_session(true)) {
+        if (!retried) {
+            retried = true;
+            prv_force_power_cut();
+            goto retry_after_power_cycle;
+        }
+        goto cleanup;
+    }
+
+    if (!prv_prepare_apn_before_time_sync()) {
         if (!retried) {
             retried = true;
             prv_force_power_cut();
