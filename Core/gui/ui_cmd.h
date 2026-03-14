@@ -16,6 +16,7 @@ extern "C" {
 #endif
 
 void UI_Cmd_ProcessLine(const char* line);
+void UI_Cmd_ProcessLineSilent(const char* line);
 
 #ifdef __cplusplus
 }

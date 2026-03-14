@@ -19,14 +19,22 @@ __weak void UI_Hook_OnBleEndRequested(void) {}
 __weak void UI_Hook_OnTestStartRequested(void) {}
 
 /* -------------------------------------------------------------------------- */
+static bool s_cmd_silent_reply = false;
+
 static void prv_send_ok(void)
 {
-    UI_UART_SendString("OK\r\n");
+    if (!s_cmd_silent_reply)
+    {
+        UI_UART_SendString("OK\r\n");
+    }
 }
 
 static void prv_send_error(void)
 {
-    UI_UART_SendString("ERROR\r\n");
+    if (!s_cmd_silent_reply)
+    {
+        UI_UART_SendString("ERROR\r\n");
+    }
 }
 
 static const char* prv_skip_spaces(const char* s)
@@ -122,6 +130,11 @@ static bool prv_commit_config_changed(void)
 static void prv_send_setting_read(void)
 {
     const UI_Config_t* cfg = UI_GetConfig();
+
+    if (s_cmd_silent_reply)
+    {
+        return;
+    }
     char netid[UI_NET_ID_LEN + 1u];
     char line[192];
 
@@ -146,8 +159,9 @@ static void prv_send_setting_read(void)
     UI_UART_SendString(line);
 }
 
-void UI_Cmd_ProcessLine(const char* line_in)
+static void prv_process_line_impl(const char* line_in, bool silent)
 {
+    s_cmd_silent_reply = silent;
     if (line_in == NULL) { return; }
 
     /* line_in은 상위에서 buffer를 넘겨주므로 안전하게 로컬 복사 */
@@ -347,4 +361,14 @@ void UI_Cmd_ProcessLine(const char* line_in)
 
     /* Unknown */
     prv_send_error();
+}
+
+void UI_Cmd_ProcessLine(const char* line)
+{
+    prv_process_line_impl(line, false);
+}
+
+void UI_Cmd_ProcessLineSilent(const char* line)
+{
+    prv_process_line_impl(line, true);
 }

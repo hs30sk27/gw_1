@@ -5,6 +5,7 @@
 #include "ui_lpm.h"
 #include "ui_ringbuf.h"
 #include "ui_ble.h"
+#include "ui_cmd.h"
 #include "main.h"
 #include "stm32wlxx_hal.h"
 #include <string.h>
@@ -118,6 +119,15 @@ static uint8_t s_failed_snapshot_queued_gw_num = 0u;
 #endif
 #ifndef GW_CATM1_POST_SMS_READY_AT_SYNC_WINDOW_MS
 #define GW_CATM1_POST_SMS_READY_AT_SYNC_WINDOW_MS (12000u)
+#endif
+#ifndef GW_CATM1_SERVER_CMD_WAIT_MS
+#define GW_CATM1_SERVER_CMD_WAIT_MS (2000u)
+#endif
+#ifndef GW_CATM1_SERVER_CMD_READLEN
+#define GW_CATM1_SERVER_CMD_READLEN (160u)
+#endif
+#ifndef GW_CATM1_SERVER_CMD_MAX_READ_PASSES
+#define GW_CATM1_SERVER_CMD_MAX_READ_PASSES (3u)
 #endif
 #ifndef GW_CATM1_POST_SMS_READY_RETRY_GAP_MS
 #define GW_CATM1_POST_SMS_READY_RETRY_GAP_MS (300u)
@@ -1461,6 +1471,233 @@ static bool prv_wait_caack_drained(uint32_t base_total, uint32_t add_len)
     return false;
 }
 
+
+static bool prv_wait_server_cmd_ind(uint32_t timeout_ms)
+{
+    char rsp[UI_CATM1_RX_BUF_SZ];
+    uint8_t ch = 0u;
+    uint32_t start = HAL_GetTick();
+    size_t n = 0u;
+
+    rsp[0] = '\0';
+    while ((uint32_t)(HAL_GetTick() - start) < timeout_ms) {
+        if (!prv_catm1_rb_pop_wait(&ch, 20u)) {
+            continue;
+        }
+        if (ch == 0u) {
+            continue;
+        }
+
+        if ((n + 1u) < sizeof(rsp)) {
+            rsp[n++] = (char)ch;
+            rsp[n] = '\0';
+        } else if (sizeof(rsp) > 16u) {
+            size_t keep = (sizeof(rsp) / 2u);
+            memmove(rsp, &rsp[sizeof(rsp) - keep - 1u], keep);
+            n = keep;
+            rsp[n++] = (char)ch;
+            rsp[n] = '\0';
+        }
+
+        if ((strstr(rsp, "+CADATAIND: 0") != NULL) ||
+            (strstr(rsp, "+CAURC: \"recv\",0,") != NULL)) {
+            return true;
+        }
+        if ((strstr(rsp, "+CASTATE: 0,0") != NULL) ||
+            (strstr(rsp, "+CACLOSE: 0") != NULL) ||
+            (strstr(rsp, "ERROR") != NULL) ||
+            (strstr(rsp, "+CME ERROR") != NULL)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool prv_parse_dec_field(const char* begin, const char* end, uint32_t* out)
+{
+    uint32_t v = 0u;
+    bool saw_digit = false;
+
+    if ((begin == NULL) || (end == NULL) || (out == NULL) || (begin >= end)) {
+        return false;
+    }
+
+    while ((begin < end) && ((*begin == ' ') || (*begin == '\t'))) {
+        begin++;
+    }
+    while ((end > begin) && ((end[-1] == ' ') || (end[-1] == '\t'))) {
+        end--;
+    }
+    while (begin < end) {
+        char ch = *begin++;
+
+        if ((ch < '0') || (ch > '9')) {
+            return false;
+        }
+        saw_digit = true;
+        v = (v * 10u) + (uint32_t)(ch - '0');
+    }
+    if (!saw_digit) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+static bool prv_extract_carecv_payload(const char* rsp, char* out, size_t out_sz, size_t* out_len)
+{
+    const char* p;
+    const char* c1;
+    const char* c2;
+    const char* c3;
+    const char* data;
+    uint32_t recv_len = 0u;
+
+    if ((rsp == NULL) || (out == NULL) || (out_sz == 0u)) {
+        return false;
+    }
+    if (out_len != NULL) {
+        *out_len = 0u;
+    }
+
+    p = strstr(rsp, "+CARECV:");
+    if (p == NULL) {
+        return false;
+    }
+    p += 8; /* strlen("+CARECV:") */
+    while ((*p == ' ') || (*p == '\t')) {
+        p++;
+    }
+
+    c1 = strchr(p, ',');
+    if (c1 == NULL) {
+        return false;
+    }
+
+    if (memchr(p, '.', (size_t)(c1 - p)) != NULL) {
+        c2 = strchr(c1 + 1, ',');
+        if (c2 == NULL) {
+            return false;
+        }
+        c3 = strchr(c2 + 1, ',');
+        if (c3 == NULL) {
+            return false;
+        }
+        if (!prv_parse_dec_field(c2 + 1, c3, &recv_len)) {
+            return false;
+        }
+        data = c3 + 1;
+    } else {
+        if (!prv_parse_dec_field(p, c1, &recv_len)) {
+            return false;
+        }
+        data = c1 + 1;
+    }
+
+    if (recv_len == 0u) {
+        out[0] = '\0';
+        return true;
+    }
+    if (strlen(data) < (size_t)recv_len) {
+        return false;
+    }
+
+    if ((size_t)recv_len >= out_sz) {
+        recv_len = (uint32_t)(out_sz - 1u);
+    }
+    memcpy(out, data, (size_t)recv_len);
+    out[recv_len] = '\0';
+    if (out_len != NULL) {
+        *out_len = (size_t)recv_len;
+    }
+    return true;
+}
+
+static bool prv_read_server_cmd_data(char* out, size_t out_sz, size_t* out_len)
+{
+    char cmd[48];
+    char rsp[UI_CATM1_RX_BUF_SZ];
+
+    if ((out == NULL) || (out_sz == 0u)) {
+        return false;
+    }
+    if (out_len != NULL) {
+        *out_len = 0u;
+    }
+
+    (void)snprintf(cmd, sizeof(cmd), "AT+CARECV=0,%u\r\n", (unsigned)GW_CATM1_SERVER_CMD_READLEN);
+    if (!prv_send_query_wait_prefix_ok(cmd, "+CARECV:", UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp))) {
+        return false;
+    }
+    return prv_extract_carecv_payload(rsp, out, out_sz, out_len);
+}
+
+static void prv_dispatch_server_cmd_frames(const char* data, size_t data_len)
+{
+    size_t i = 0u;
+    char frame[UI_UART_LINE_MAX];
+
+    if ((data == NULL) || (data_len == 0u)) {
+        return;
+    }
+
+    while (i < data_len) {
+        size_t start;
+        size_t end;
+        size_t frame_len;
+
+        while ((i < data_len) && (data[i] != '<')) {
+            i++;
+        }
+        if (i >= data_len) {
+            break;
+        }
+
+        start = i;
+        end = start;
+        while ((end < data_len) && (data[end] != '>')) {
+            end++;
+        }
+        if ((end >= data_len) || (data[end] != '>')) {
+            break;
+        }
+
+        frame_len = (end - start) + 1u;
+        if (frame_len < sizeof(frame)) {
+            memcpy(frame, &data[start], frame_len);
+            frame[frame_len] = '\0';
+            UI_Cmd_ProcessLineSilent(frame);
+        }
+        i = end + 1u;
+    }
+}
+
+static void prv_receive_server_cmd_after_first_payload(void)
+{
+    char data[GW_CATM1_SERVER_CMD_READLEN + 1u];
+    size_t data_len = 0u;
+    uint32_t pass;
+    bool saw_ind;
+
+    saw_ind = prv_wait_server_cmd_ind(GW_CATM1_SERVER_CMD_WAIT_MS);
+    for (pass = 0u; pass < GW_CATM1_SERVER_CMD_MAX_READ_PASSES; pass++) {
+        if (!prv_read_server_cmd_data(data, sizeof(data), &data_len)) {
+            if (!saw_ind || (pass > 0u)) {
+                break;
+            }
+            continue;
+        }
+        if (data_len == 0u) {
+            break;
+        }
+        prv_dispatch_server_cmd_frames(data, data_len);
+        if (data_len < GW_CATM1_SERVER_CMD_READLEN) {
+            break;
+        }
+        prv_delay_ms(20u);
+    }
+}
+
 static bool prv_send_tcp_payload(const char* payload)
 {
     char cmd[48];
@@ -2101,6 +2338,7 @@ bool GW_Catm1_SendSnapshot(const GW_HourRec_t* rec)
     if (!prv_send_tcp_payload(payload)) {
         goto cleanup;
     }
+    prv_receive_server_cmd_after_first_payload();
     success = true;
     prv_note_failed_snapshot_sent();
 
@@ -2180,6 +2418,9 @@ bool GW_Catm1_SendStoredRange(uint32_t first_rec_index, uint32_t max_count, uint
         }
         if (!prv_send_tcp_payload(payload)) {
             break;
+        }
+        if ((*out_sent_count) == 0u) {
+            prv_receive_server_cmd_after_first_payload();
         }
         (*out_sent_count)++;
         prv_note_failed_snapshot_sent();
