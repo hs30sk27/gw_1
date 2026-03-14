@@ -104,6 +104,12 @@ static uint8_t s_failed_snapshot_queued_gw_num = 0u;
 #ifndef GW_CATM1_TCP_OPEN_FAIL_CPOWD_POST_TX_HOLD_MS
 #define GW_CATM1_TCP_OPEN_FAIL_CPOWD_POST_TX_HOLD_MS (150u)
 #endif
+#ifndef GW_CATM1_TCP_POST_CLOSE_POWER_CUT_GUARD_MS
+#define GW_CATM1_TCP_POST_CLOSE_POWER_CUT_GUARD_MS (300u)
+#endif
+#ifndef GW_CATM1_POST_TIME_SYNC_POWER_CUT_GUARD_MS
+#define GW_CATM1_POST_TIME_SYNC_POWER_CUT_GUARD_MS (100u)
+#endif
 #ifndef GW_CATM1_CCLK_QUERY_COMP_MAX_CENTI
 #define GW_CATM1_CCLK_QUERY_COMP_MAX_CENTI (250u)
 #endif
@@ -145,14 +151,7 @@ static uint8_t s_failed_snapshot_queued_gw_num = 0u;
 static bool prv_tcp_blocked_by_ble(void)
 {
 #if UI_HAVE_BT_EN
-    if (!UI_BLE_IsActive()) {
-        return false;
-    }
-    /* TEST START 유지 모드에서는 BLE가 살아 있어도 TCP 업링크를 허용한다. */
-    if (UI_BLE_IsPersistent()) {
-        return false;
-    }
-    return true;
+    return UI_BLE_IsActive();
 #else
     return false;
 #endif
@@ -259,6 +258,8 @@ static void prv_format_epoch2016(uint32_t epoch_sec, char* out, size_t out_sz)
 
 static bool prv_activate_pdp(void);
 static void prv_enable_network_time_auto_update(void);
+static void prv_force_power_cut(void);
+static void prv_close_tcp_and_force_power_cut(bool opened, char* rsp, size_t rsp_sz);
 static void prv_note_failed_snapshot_sent(void);
 static bool prv_wait_eps_registered(void);
 static bool prv_wait_eps_registered_until(uint32_t timeout_ms);
@@ -1302,6 +1303,31 @@ static void prv_finish_power_off_state(void)
     s_catm1_last_poweroff_ms = HAL_GetTick();
 }
 
+static void prv_force_power_cut(void)
+{
+#if defined(PWR_KEY_Pin)
+    HAL_GPIO_WritePin(PWR_KEY_GPIO_Port, PWR_KEY_Pin, UI_CATM1_PWRKEY_INACTIVE_STATE);
+#endif
+#if defined(CATM1_PWR_Pin)
+    HAL_GPIO_WritePin(CATM1_PWR_GPIO_Port, CATM1_PWR_Pin, GPIO_PIN_RESET);
+#elif defined(PWR_KEY_Pin)
+    HAL_GPIO_WritePin(PWR_KEY_GPIO_Port, PWR_KEY_Pin, UI_CATM1_PWRKEY_ACTIVE_STATE);
+    prv_delay_ms(UI_CATM1_PWRKEY_OFF_PULSE_MS);
+    HAL_GPIO_WritePin(PWR_KEY_GPIO_Port, PWR_KEY_Pin, UI_CATM1_PWRKEY_INACTIVE_STATE);
+#endif
+    prv_finish_power_off_state();
+}
+
+static void prv_close_tcp_and_force_power_cut(bool opened, char* rsp, size_t rsp_sz)
+{
+    if (opened) {
+        (void)prv_send_cmd_wait("AT+CACLOSE=0\r\n", "OK", NULL, NULL,
+                                UI_CATM1_AT_TIMEOUT_MS, rsp, rsp_sz);
+        prv_delay_ms(GW_CATM1_TCP_POST_CLOSE_POWER_CUT_GUARD_MS);
+    }
+    prv_force_power_cut();
+}
+
 static bool prv_open_tcp(const uint8_t ip[4], uint16_t port)
 {
     char cmd[96];
@@ -1918,7 +1944,8 @@ bool GW_Catm1_SyncTimeOnce(void)
     success = prv_sync_time_from_modem_startup();
 
 cleanup:
-    GW_Catm1_PowerOff();
+    prv_delay_ms(GW_CATM1_POST_TIME_SYNC_POWER_CUT_GUARD_MS);
+    prv_force_power_cut();
     prv_lpuart_release();
     GW_Catm1_SetBusy(false);
     UI_LPM_UnlockStop();
@@ -2078,11 +2105,8 @@ bool GW_Catm1_SendSnapshot(const GW_HourRec_t* rec)
     prv_note_failed_snapshot_sent();
 
 cleanup:
-    if (opened) {
-        (void)prv_send_cmd_wait("AT+CACLOSE=0\r\n", "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
-    }
+    prv_close_tcp_and_force_power_cut(opened, rsp, sizeof(rsp));
     (void)pdp_active;
-    GW_Catm1_PowerOff();
     prv_lpuart_release();
     GW_Catm1_SetBusy(false);
     UI_LPM_UnlockStop();
@@ -2163,11 +2187,8 @@ bool GW_Catm1_SendStoredRange(uint32_t first_rec_index, uint32_t max_count, uint
     success = ((*out_sent_count) > 0u);
 
 cleanup:
-    if (opened) {
-        (void)prv_send_cmd_wait("AT+CACLOSE=0\r\n", "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
-    }
+    prv_close_tcp_and_force_power_cut(opened, rsp, sizeof(rsp));
     (void)pdp_active;
-    GW_Catm1_PowerOff();
     prv_lpuart_release();
     GW_Catm1_SetBusy(false);
     UI_LPM_UnlockStop();
