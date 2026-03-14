@@ -269,7 +269,9 @@ static void prv_format_epoch2016(uint32_t epoch_sec, char* out, size_t out_sz)
 
 static bool prv_activate_pdp(void);
 static void prv_enable_network_time_auto_update(void);
-static bool prv_sync_time_from_modem_startup_try(bool run_time_auto_update_setup);
+static bool prv_sync_time_from_modem_startup_try(bool run_time_auto_update_setup,
+                                                  bool abort_on_initial_invalid,
+                                                  bool* out_initial_invalid_cclk);
 static void prv_force_power_cut(void);
 static void prv_close_tcp_and_force_power_cut(bool opened, char* rsp, size_t rsp_sz);
 static void prv_note_failed_snapshot_sent(void);
@@ -913,7 +915,8 @@ static uint64_t prv_compensate_cclk_epoch(uint64_t epoch_centi, uint32_t elapsed
 }
 
 static bool prv_query_network_time_epoch_retry(uint32_t max_try, uint32_t gap_ms,
-                                               bool break_on_invalid, uint64_t* out_epoch_centi)
+                                               bool break_on_invalid, bool* out_invalid_seen,
+                                               uint64_t* out_epoch_centi)
 {
     char rsp[UI_CATM1_RX_BUF_SZ];
     uint32_t i;
@@ -937,8 +940,13 @@ static bool prv_query_network_time_epoch_retry(uint32_t max_try, uint32_t gap_ms
                                                          (uint32_t)(HAL_GetTick() - query_start_ms));
             return true;
         }
-        if (break_on_invalid && prv_is_invalid_cclk_rsp(rsp)) {
-            break;
+        if (prv_is_invalid_cclk_rsp(rsp)) {
+            if (out_invalid_seen != NULL) {
+                *out_invalid_seen = true;
+            }
+            if (break_on_invalid) {
+                break;
+            }
         }
         if ((i + 1u) < max_try) {
             prv_delay_ms(gap_ms);
@@ -953,7 +961,7 @@ static bool prv_query_network_time_epoch(uint64_t* out_epoch_centi)
     if (max_try > 2u) {
         max_try = 2u;
     }
-    return prv_query_network_time_epoch_retry(max_try, UI_CATM1_TIME_SYNC_GAP_MS, true, out_epoch_centi);
+    return prv_query_network_time_epoch_retry(max_try, UI_CATM1_TIME_SYNC_GAP_MS, true, NULL, out_epoch_centi);
 }
 
 static bool prv_ntp_sync_time(uint64_t* out_epoch_centi)
@@ -974,22 +982,28 @@ static bool prv_ntp_sync_time(uint64_t* out_epoch_centi)
         return false;
     }
     prv_delay_ms(1000u);
-    return prv_query_network_time_epoch_retry(6u, 1000u, false, out_epoch_centi);
+    return prv_query_network_time_epoch_retry(6u, 1000u, false, NULL, out_epoch_centi);
 }
 
-static bool prv_sync_time_from_modem_startup_try(bool run_time_auto_update_setup)
+static bool prv_sync_time_from_modem_startup_try(bool run_time_auto_update_setup,
+                                                  bool abort_on_initial_invalid,
+                                                  bool* out_initial_invalid_cclk)
 {
     uint64_t epoch_centi = 0u;
     int64_t delta_sec;
     bool cpin_ready = false;
     bool reg_ok = false;
     bool ps_ok = false;
+    bool initial_invalid_cclk = false;
     char rsp[UI_CATM1_RX_BUF_SZ];
 
     rsp[0] = '\0';
     if (prv_send_query_wait_prefix_ok("AT+CPIN?\r\n", "+CPIN:", UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp)) &&
         (strstr(rsp, "+CPIN: READY") != NULL)) {
         cpin_ready = true;
+    }
+    if (out_initial_invalid_cclk != NULL) {
+        *out_initial_invalid_cclk = false;
     }
     if (!cpin_ready) {
         return false;
@@ -1005,14 +1019,22 @@ static bool prv_sync_time_from_modem_startup_try(bool run_time_auto_update_setup
     if (prv_query_network_time_epoch_retry(GW_CATM1_STARTUP_CCLK_FIRST_TRY,
                                            GW_CATM1_STARTUP_CCLK_GAP_MS,
                                            true,
+                                           &initial_invalid_cclk,
                                            &epoch_centi)) {
         goto apply_time;
+    }
+    if (out_initial_invalid_cclk != NULL) {
+        *out_initial_invalid_cclk = initial_invalid_cclk;
+    }
+    if (abort_on_initial_invalid && initial_invalid_cclk) {
+        return false;
     }
 
     reg_ok = prv_wait_eps_registered_until(GW_CATM1_STARTUP_REG_WAIT_MS);
     if (reg_ok && prv_query_network_time_epoch_retry(GW_CATM1_STARTUP_CCLK_POST_REG_TRY,
                                                      1000u,
                                                      false,
+                                                     NULL,
                                                      &epoch_centi)) {
         goto apply_time;
     }
@@ -1022,6 +1044,7 @@ static bool prv_sync_time_from_modem_startup_try(bool run_time_auto_update_setup
         if (ps_ok && prv_query_network_time_epoch_retry(GW_CATM1_STARTUP_CCLK_POST_ATTACH_TRY,
                                                         1000u,
                                                         false,
+                                                        NULL,
                                                         &epoch_centi)) {
             goto apply_time;
         }
@@ -1041,15 +1064,7 @@ apply_time:
 
 static bool prv_sync_time_from_modem_startup(void)
 {
-    if (prv_sync_time_from_modem_startup_try(true)) {
-        return true;
-    }
-
-    if (GW_CATM1_STARTUP_SYNC_RETRY_GAP_MS != 0u) {
-        prv_delay_ms(GW_CATM1_STARTUP_SYNC_RETRY_GAP_MS);
-    }
-
-    return prv_sync_time_from_modem_startup_try(false);
+    return prv_sync_time_from_modem_startup_try(true, false, NULL);
 }
 
 static bool prv_sync_time_from_modem(void)
@@ -2197,6 +2212,9 @@ uint8_t GW_Catm1_CopyTimeSyncDeltaBuf(int64_t* out_buf, uint8_t max_items)
 bool GW_Catm1_SyncTimeOnce(void)
 {
     bool success = false;
+    bool retried = false;
+    bool time_auto_update_used = false;
+    bool initial_invalid_cclk = false;
 
     if (GW_Catm1_IsBusy()) {
         return false;
@@ -2207,10 +2225,31 @@ bool GW_Catm1_SyncTimeOnce(void)
     if (!prv_lpuart_ensure()) {
         goto cleanup;
     }
+
+retry_after_power_cycle:
     if (!prv_start_session(true)) {
+        if (!retried) {
+            retried = true;
+            prv_force_power_cut();
+            goto retry_after_power_cycle;
+        }
         goto cleanup;
     }
-    success = prv_sync_time_from_modem_startup();
+
+    if (time_auto_update_used) {
+        s_catm1_time_auto_update_attempted_this_power = true;
+    }
+
+    success = prv_sync_time_from_modem_startup_try(!time_auto_update_used,
+                                                   !retried,
+                                                   &initial_invalid_cclk);
+    time_auto_update_used = time_auto_update_used || s_catm1_time_auto_update_attempted_this_power;
+
+    if (!success && !retried) {
+        retried = true;
+        prv_force_power_cut();
+        goto retry_after_power_cycle;
+    }
 
 cleanup:
     prv_delay_ms(GW_CATM1_POST_TIME_SYNC_POWER_CUT_GUARD_MS);
@@ -2243,7 +2282,7 @@ bool GW_Catm1_QueryAndStoreLoc(char* out_line, size_t out_sz)
         goto cleanup;
     }
     if (prv_wait_eps_registered() && prv_wait_ps_attached()) {
-        (void)prv_sync_time_from_modem_startup();
+        (void)prv_sync_time_from_modem_startup_try(true, false, NULL);
     }
     if (!prv_query_gnss_loc_line(loc_line, sizeof(loc_line))) {
         goto cleanup;
