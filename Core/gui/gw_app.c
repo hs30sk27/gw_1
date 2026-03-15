@@ -1392,7 +1392,7 @@ void GW_App_Init(void)
     s_catm1_retry_not_before_ms = 0u;
     s_last_catm1_slot_id = 0xFFFFFFFFu;
     s_last_2m_prep_slot_id = 0xFFFFFFFFu;
-    s_boot_time_sync_pending = true;
+    s_boot_time_sync_pending = !UI_Time_IsValid();
     prv_hour_rec_init(prv_get_current_cycle_timestamp_sec());
     s_inited = true;
     prv_schedule_wakeup();

@@ -15,6 +15,7 @@
 extern UART_HandleTypeDef hlpuart1;
 extern bool GW_Storage_SaveHourRec(const GW_HourRec_t* rec);
 extern uint32_t GW_Storage_GetTotalRecordCount(void);
+extern void UI_Hook_OnTimeChanged(void);
 
 static volatile bool s_catm1_busy = false;
 static volatile bool s_catm1_session_at_ok = false;
@@ -123,7 +124,7 @@ static uint8_t s_failed_snapshot_queued_gw_num = 0u;
 #define GW_CATM1_POST_SMS_READY_AT_SYNC_WINDOW_MS (12000u)
 #endif
 #ifndef GW_CATM1_SERVER_CMD_WAIT_MS
-#define GW_CATM1_SERVER_CMD_WAIT_MS (2000u)
+#define GW_CATM1_SERVER_CMD_WAIT_MS (1000u)
 #endif
 #ifndef GW_CATM1_SERVER_CMD_READLEN
 #define GW_CATM1_SERVER_CMD_READLEN (160u)
@@ -318,6 +319,175 @@ static void prv_time_sync_delta_push(int64_t delta_sec)
     }
 }
 
+static bool prv_is_trim_char(char ch)
+{
+    return ((ch == ' ') || (ch == '\t') || (ch == '\r') || (ch == '\n'));
+}
+
+static bool prv_parse_psuttz_epoch(const char* line, uint64_t* out_epoch_centi)
+{
+    const char* p;
+    int year = 0;
+    int mon = 0;
+    int day = 0;
+    int hh = 0;
+    int mm = 0;
+    int ss = 0;
+    int dst = 0;
+    int tz_qh = 0;
+    int n;
+    int64_t epoch_centi;
+    char tz_str[8] = {0};
+    UI_DateTime_t dt = {0};
+
+    if ((line == NULL) || (out_epoch_centi == NULL)) {
+        return false;
+    }
+
+    p = strstr(line, "*PSUTTZ:");
+    if (p == NULL) {
+        return false;
+    }
+    p += 8;
+    while ((*p == ' ') || (*p == '\t')) {
+        p++;
+    }
+
+    n = sscanf(p, "%d,%d,%d,%d,%d,%d,\"%7[^\"]\",%d",
+               &year, &mon, &day, &hh, &mm, &ss, tz_str, &dst);
+    if (n < 7) {
+        return false;
+    }
+    (void)dst;
+
+    if ((year < 2016) || (year > 2099) ||
+        (mon < 1) || (mon > 12) ||
+        (day < 1) || (day > 31) ||
+        (hh < 0) || (hh > 23) ||
+        (mm < 0) || (mm > 59) ||
+        (ss < 0) || (ss > 59)) {
+        return false;
+    }
+
+    dt.year = (uint16_t)year;
+    dt.month = (uint8_t)mon;
+    dt.day = (uint8_t)day;
+    dt.hour = (uint8_t)hh;
+    dt.min = (uint8_t)mm;
+    dt.sec = (uint8_t)ss;
+    dt.centi = 0u;
+
+    epoch_centi = (int64_t)((uint64_t)UI_Time_Epoch2016_FromCalendar(&dt) * 100u);
+
+    if ((tz_str[0] == '+') || (tz_str[0] == '-')) {
+        if (sscanf(&tz_str[1], "%d", &tz_qh) != 1) {
+            return false;
+        }
+        if (tz_str[0] == '-') {
+            tz_qh = -tz_qh;
+        }
+    } else if (sscanf(tz_str, "%d", &tz_qh) != 1) {
+        return false;
+    }
+
+    epoch_centi += ((int64_t)tz_qh * 15LL * 60LL * 100LL);
+    if (epoch_centi < 0) {
+        return false;
+    }
+
+    *out_epoch_centi = (uint64_t)epoch_centi;
+    return true;
+}
+
+static void prv_apply_async_time_epoch(uint64_t epoch_centi)
+{
+    int64_t delta_sec = (int64_t)(epoch_centi / 100u) - (int64_t)UI_Time_NowSec2016();
+
+    prv_time_sync_delta_push(delta_sec);
+    UI_Time_SetEpochCenti2016(epoch_centi);
+    UI_Hook_OnTimeChanged();
+}
+
+static bool prv_try_consume_async_urc_line(const char* line, size_t line_len)
+{
+    const char* begin = line;
+    const char* end = line + line_len;
+    uint64_t epoch_centi = 0u;
+    size_t copy_len;
+    char tmp[96];
+
+    while ((begin < end) && prv_is_trim_char(*begin)) {
+        begin++;
+    }
+    while ((end > begin) && prv_is_trim_char(end[-1])) {
+        end--;
+    }
+    if (end <= begin) {
+        return false;
+    }
+
+    if (strncmp(begin, "*PSUTTZ:", 8) != 0) {
+        return false;
+    }
+
+    copy_len = (size_t)(end - begin);
+    if (copy_len >= sizeof(tmp)) {
+        copy_len = sizeof(tmp) - 1u;
+    }
+    memcpy(tmp, begin, copy_len);
+    tmp[copy_len] = '\0';
+
+    if (prv_parse_psuttz_epoch(tmp, &epoch_centi)) {
+        prv_apply_async_time_epoch(epoch_centi);
+    }
+    return true;
+}
+
+static void prv_filter_async_urc_buffer(char* buf)
+{
+    size_t len;
+    size_t rd = 0u;
+    size_t wr = 0u;
+
+    if (buf == NULL) {
+        return;
+    }
+
+    len = strlen(buf);
+    while (rd < len) {
+        size_t line_start = rd;
+        size_t line_end = rd;
+        bool have_term = false;
+
+        while (line_end < len) {
+            if (buf[line_end] == '\n') {
+                line_end++;
+                have_term = true;
+                break;
+            }
+            line_end++;
+        }
+
+        if (!have_term) {
+            if (wr != line_start) {
+                memmove(&buf[wr], &buf[line_start], len - line_start);
+            }
+            wr += (len - line_start);
+            break;
+        }
+
+        if (!prv_try_consume_async_urc_line(&buf[line_start], line_end - line_start)) {
+            if (wr != line_start) {
+                memmove(&buf[wr], &buf[line_start], line_end - line_start);
+            }
+            wr += (line_end - line_start);
+        }
+        rd = line_end;
+    }
+
+    buf[wr] = '\0';
+}
+
 static void prv_catm1_rx_start_it(void)
 {
     HAL_StatusTypeDef st;
@@ -498,6 +668,8 @@ static bool prv_uart_wait_for(char* out, size_t out_sz, uint32_t timeout_ms,
             out[n++] = (char)ch;
             out[n] = '\0';
         }
+        prv_filter_async_urc_buffer(out);
+        n = strlen(out);
         if ((strstr(out, "ERROR") != NULL) || (strstr(out, "+CME ERROR") != NULL)) {
             return false;
         }
@@ -576,6 +748,8 @@ static bool prv_send_query_wait_prefix_ok(const char* cmd, const char* prefix,
             out[n++] = (char)ch;
             out[n] = '\0';
         }
+        prv_filter_async_urc_buffer(out);
+        n = strlen(out);
         if ((strstr(out, "ERROR") != NULL) || (strstr(out, "+CME ERROR") != NULL)) {
             return false;
         }
@@ -638,6 +812,8 @@ static bool prv_send_query_wait_cnact_ok(char* out, size_t out_sz)
             out[n++] = (char)ch;
             out[n] = '\0';
         }
+        prv_filter_async_urc_buffer(out);
+        n = strlen(out);
         if ((strstr(out, "ERROR") != NULL) || (strstr(out, "+CME ERROR") != NULL)) {
             return false;
         }
@@ -1620,6 +1796,9 @@ static bool prv_wait_server_cmd_ind(uint32_t timeout_ms)
             rsp[n] = '\0';
         }
 
+        prv_filter_async_urc_buffer(rsp);
+        n = strlen(rsp);
+
         if ((strstr(rsp, "+CADATAIND: 0") != NULL) ||
             (strstr(rsp, "+CAURC: \"recv\",0,") != NULL)) {
             return true;
@@ -1753,6 +1932,53 @@ static bool prv_read_server_cmd_data(char* out, size_t out_sz, size_t* out_len)
     return prv_extract_carecv_payload(rsp, out, out_sz, out_len);
 }
 
+static bool prv_is_server_plain_time_cmd(const char* s)
+{
+    if (s == NULL) {
+        return false;
+    }
+
+    while (prv_is_trim_char(*s)) {
+        s++;
+    }
+    return (strncmp(s, "TIME:", 5) == 0);
+}
+
+static void prv_dispatch_server_plain_time_line(const char* line, size_t line_len)
+{
+    const char* begin = line;
+    const char* end = line + line_len;
+    char framed[UI_UART_LINE_MAX];
+    size_t cmd_len;
+
+    while ((begin < end) && prv_is_trim_char(*begin)) {
+        begin++;
+    }
+    while ((end > begin) && prv_is_trim_char(end[-1])) {
+        end--;
+    }
+    if (end <= begin) {
+        return;
+    }
+    if (*begin == '<') {
+        return;
+    }
+    if (!prv_is_server_plain_time_cmd(begin)) {
+        return;
+    }
+
+    cmd_len = (size_t)(end - begin);
+    if ((cmd_len + 3u) > sizeof(framed)) {
+        return;
+    }
+
+    framed[0] = '<';
+    memcpy(&framed[1], begin, cmd_len);
+    framed[1u + cmd_len] = '>';
+    framed[1u + cmd_len + 1u] = '\0';
+    UI_Cmd_ProcessLineSilent(framed);
+}
+
 static void prv_dispatch_server_cmd_frames(const char* data, size_t data_len)
 {
     size_t i = 0u;
@@ -1790,6 +2016,27 @@ static void prv_dispatch_server_cmd_frames(const char* data, size_t data_len)
             UI_Cmd_ProcessLineSilent(frame);
         }
         i = end + 1u;
+    }
+
+    i = 0u;
+    while (i < data_len) {
+        size_t start;
+        size_t end;
+
+        while ((i < data_len) && ((data[i] == '\r') || (data[i] == '\n'))) {
+            i++;
+        }
+        if (i >= data_len) {
+            break;
+        }
+
+        start = i;
+        end = start;
+        while ((end < data_len) && (data[end] != '\r') && (data[end] != '\n')) {
+            end++;
+        }
+        prv_dispatch_server_plain_time_line(&data[start], end - start);
+        i = end;
     }
 }
 
