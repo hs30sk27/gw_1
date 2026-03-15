@@ -175,6 +175,15 @@ static uint8_t s_failed_snapshot_queued_gw_num = 0u;
 #ifndef GW_CATM1_SERVER_CCLK_SYNC_GAP_MS
 #define GW_CATM1_SERVER_CCLK_SYNC_GAP_MS (150u)
 #endif
+#ifndef GW_CATM1_PROFILE_SAVE_SETTLE_MS
+#define GW_CATM1_PROFILE_SAVE_SETTLE_MS (300u)
+#endif
+#ifndef GW_CATM1_POWEROFF_CFUN_TIMEOUT_MS
+#define GW_CATM1_POWEROFF_CFUN_TIMEOUT_MS (2000u)
+#endif
+#ifndef GW_CATM1_POWEROFF_CFUN_SETTLE_MS
+#define GW_CATM1_POWEROFF_CFUN_SETTLE_MS (300u)
+#endif
 
 #ifndef GW_TCP_INTERNAL_TEMP_COMP_C
 #define GW_TCP_INTERNAL_TEMP_COMP_C ((int8_t)-4)
@@ -304,6 +313,9 @@ static bool prv_wait_eps_registered_until(uint32_t timeout_ms);
 static bool prv_wait_ps_attached(void);
 static bool prv_wait_ps_attached_until(uint32_t timeout_ms);
 static bool prv_try_session_resync(void);
+static void prv_store_user_profile_cfun0(void);
+static bool prv_apply_time_auto_update_cfg(bool persist_profile);
+static void prv_prepare_low_current_before_poweroff(void);
 
 static void prv_catm1_rb_reset(void)
 {
@@ -1029,6 +1041,10 @@ static bool prv_prepare_apn_before_time_sync(void)
                                   GW_CATM1_APN_BOOTSTRAP_CFUN_TIMEOUT_MS, rsp, sizeof(rsp));
     if (did_cfun0) {
         prv_wait_rx_quiet(100u, GW_CATM1_APN_BOOTSTRAP_CFUN_OFF_SETTLE_MS);
+
+        /* Apply CTZR=0/CTZU=1 while RF is off so the boot log contains the command. */
+        (void)prv_apply_time_auto_update_cfg(false);
+        prv_wait_rx_quiet(100u, 400u);
     }
 
     (void)snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"\r\n", UI_CATM1_1NCE_APN);
@@ -1045,6 +1061,8 @@ static bool prv_prepare_apn_before_time_sync(void)
     }
 
     if (did_cfun0) {
+        /* Save APN/time related settings while CFUN=0. */
+        prv_store_user_profile_cfun0();
         prv_wait_rx_quiet(100u, 400u);
         rsp[0] = '\0';
         if (!prv_send_cmd_wait("AT+CFUN=1\r\n", "OK", NULL, NULL,
@@ -1065,6 +1083,9 @@ static bool prv_prepare_apn_before_time_sync(void)
             return false;
         }
 
+        /* Re-apply for the current live session after CFUN=1. */
+        (void)prv_apply_time_auto_update_cfg(false);
+        s_catm1_time_auto_update_attempted_this_power = true;
         prv_wait_rx_quiet(200u, 1200u);
     }
 
@@ -1074,22 +1095,55 @@ static bool prv_prepare_apn_before_time_sync(void)
     return true;
 }
 
-static void prv_enable_network_time_auto_update(void)
+static void prv_store_user_profile_cfun0(void)
+{
+    static const char* const save_cmds[] = {
+        "AT&W\r\n",
+        "AT&W0\r\n",
+        "AT&W1\r\n",
+    };
+    char rsp[UI_CATM1_RX_BUF_SZ];
+    uint32_t i;
+
+    for (i = 0u; i < (uint32_t)(sizeof(save_cmds) / sizeof(save_cmds[0])); i++) {
+        prv_wait_rx_quiet(100u, 400u);
+        rsp[0] = '\0';
+        if (prv_send_cmd_wait(save_cmds[i], "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp))) {
+            prv_wait_rx_quiet(100u, GW_CATM1_PROFILE_SAVE_SETTLE_MS);
+            return;
+        }
+        (void)prv_try_session_resync();
+    }
+}
+
+static bool prv_apply_time_auto_update_cfg(bool persist_profile)
 {
     char rsp[UI_CATM1_RX_BUF_SZ];
 
-    if (s_catm1_time_auto_update_attempted_this_power) {
-        return;
-    }
-
-    /* 주기적인 시간/타임존 URC 노출은 막고, 자동 시간 보정은 유지한다.
-     * AT&W는 SIM7080에서 ERROR일 수 있으므로 사용하지 않는다. */
     rsp[0] = '\0';
     (void)prv_send_cmd_wait("AT+CTZR=0\r\n", "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
     prv_wait_rx_quiet(100u, 300u);
 
     rsp[0] = '\0';
     if (!prv_send_cmd_wait("AT+CTZU=1\r\n", "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp))) {
+        return false;
+    }
+    prv_wait_rx_quiet(100u, 300u);
+
+    if (persist_profile) {
+        prv_store_user_profile_cfun0();
+    }
+    return true;
+}
+
+static void prv_enable_network_time_auto_update(void)
+{
+    if (s_catm1_time_auto_update_attempted_this_power) {
+        return;
+    }
+
+    /* Apply once immediately after boot. */
+    if (!prv_apply_time_auto_update_cfg(false)) {
         return;
     }
 
@@ -1283,7 +1337,6 @@ static bool prv_sync_time_from_modem_startup_try(bool run_time_auto_update_setup
                                                   bool* out_initial_invalid_cclk)
 {
     uint64_t epoch_centi = 0u;
-    int64_t delta_sec;
     bool cpin_ready = false;
     bool reg_ok = false;
     bool ps_ok = false;
@@ -1349,9 +1402,7 @@ static bool prv_sync_time_from_modem_startup_try(bool run_time_auto_update_setup
     return false;
 
 apply_time:
-    delta_sec = (int64_t)(epoch_centi / 100u) - (int64_t)UI_Time_NowSec2016();
-    prv_time_sync_delta_push(delta_sec);
-    UI_Time_SetEpochCenti2016(epoch_centi);
+    prv_apply_time_epoch(epoch_centi, true);
     return true;
 }
 
@@ -2502,6 +2553,22 @@ void GW_Catm1_PowerOn(void)
 #endif
 }
 
+static void prv_prepare_low_current_before_poweroff(void)
+{
+    char rsp[UI_CATM1_RX_BUF_SZ];
+
+    if (!prv_lpuart_is_inited() || !s_catm1_session_at_ok) {
+        return;
+    }
+
+    prv_wait_rx_quiet(50u, 200u);
+    rsp[0] = '\0';
+    if (prv_send_cmd_wait("AT+CFUN=0\r\n", "OK", NULL, NULL,
+                          GW_CATM1_POWEROFF_CFUN_TIMEOUT_MS, rsp, sizeof(rsp))) {
+        prv_wait_rx_quiet(50u, GW_CATM1_POWEROFF_CFUN_SETTLE_MS);
+    }
+}
+
 void GW_Catm1_PowerOff(void)
 {
     char rsp[UI_CATM1_RX_BUF_SZ];
@@ -2543,6 +2610,8 @@ void GW_Catm1_PowerOff(void)
     HAL_GPIO_WritePin(PWR_KEY_GPIO_Port, PWR_KEY_Pin, UI_CATM1_PWRKEY_INACTIVE_STATE);
 #endif
     if (prv_lpuart_is_inited() && s_catm1_session_at_ok) {
+        /* Reduce current first, then perform normal power down. */
+        prv_prepare_low_current_before_poweroff();
         if (prv_send_cmd_wait("AT+CPOWD=1\r\n", "NORMAL POWER DOWN", "OK", NULL,
                               pd_timeout_ms, rsp, sizeof(rsp))) {
             normal_pd = true;
