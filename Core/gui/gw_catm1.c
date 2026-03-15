@@ -34,6 +34,7 @@ static uint8_t s_time_sync_delta_wr = 0u;
 static uint8_t s_time_sync_delta_count = 0u;
 static bool s_catm1_time_auto_update_attempted_this_power = false;
 static bool s_catm1_startup_apn_configured_this_power = false;
+static bool s_catm1_tcp_time_sync_pending = false;
 
 static bool s_failed_snapshot_queued_valid = false;
 static uint32_t s_failed_snapshot_queued_epoch_sec = 0u;
@@ -165,6 +166,15 @@ static uint8_t s_failed_snapshot_queued_gw_num = 0u;
 #ifndef GW_CATM1_APN_BOOTSTRAP_CFUN_TIMEOUT_MS
 #define GW_CATM1_APN_BOOTSTRAP_CFUN_TIMEOUT_MS (5000u)
 #endif
+#ifndef GW_CATM1_SERVER_CCLK_TIMEOUT_MS
+#define GW_CATM1_SERVER_CCLK_TIMEOUT_MS (1500u)
+#endif
+#ifndef GW_CATM1_SERVER_CCLK_SYNC_RETRY
+#define GW_CATM1_SERVER_CCLK_SYNC_RETRY (2u)
+#endif
+#ifndef GW_CATM1_SERVER_CCLK_SYNC_GAP_MS
+#define GW_CATM1_SERVER_CCLK_SYNC_GAP_MS (150u)
+#endif
 
 #ifndef GW_TCP_INTERNAL_TEMP_COMP_C
 #define GW_TCP_INTERNAL_TEMP_COMP_C ((int8_t)-4)
@@ -284,6 +294,8 @@ static void prv_enable_network_time_auto_update(void);
 static bool prv_sync_time_from_modem_startup_try(bool run_time_auto_update_setup,
                                                   bool abort_on_initial_invalid,
                                                   bool* out_initial_invalid_cclk);
+static bool prv_sync_time_from_modem_quick(bool notify_hook);
+static void prv_sync_time_before_first_tcp_send(void);
 static void prv_force_power_cut(void);
 static void prv_close_tcp_and_force_power_cut(bool opened, char* rsp, size_t rsp_sz);
 static void prv_note_failed_snapshot_sent(void);
@@ -399,13 +411,15 @@ static bool prv_parse_psuttz_epoch(const char* line, uint64_t* out_epoch_centi)
     return true;
 }
 
-static void prv_apply_async_time_epoch(uint64_t epoch_centi)
+static void prv_apply_time_epoch(uint64_t epoch_centi, bool notify_hook)
 {
     int64_t delta_sec = (int64_t)(epoch_centi / 100u) - (int64_t)UI_Time_NowSec2016();
 
     prv_time_sync_delta_push(delta_sec);
     UI_Time_SetEpochCenti2016(epoch_centi);
-    UI_Hook_OnTimeChanged();
+    if (notify_hook) {
+        UI_Hook_OnTimeChanged();
+    }
 }
 
 static bool prv_try_consume_async_urc_line(const char* line, size_t line_len)
@@ -438,7 +452,7 @@ static bool prv_try_consume_async_urc_line(const char* line, size_t line_len)
     tmp[copy_len] = '\0';
 
     if (prv_parse_psuttz_epoch(tmp, &epoch_centi)) {
-        prv_apply_async_time_epoch(epoch_centi);
+        prv_apply_time_epoch(epoch_centi, true);
     }
     return true;
 }
@@ -979,9 +993,12 @@ static bool prv_start_session(bool enable_time_auto_update)
     rsp[0] = '\0';
     (void)prv_send_cmd_wait("AT+CEREG=2\r\n", "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
 
-    /* CTZU/AT&W는 실제 시간 동기화 경로(prv_sync_time_from_modem_startup)에서
-     * 전원 인가당 한 번만 처리한다. */
+    /* 전원 인가 후에는 세션별로 CTZR/CTZU를 다시 적용해 둔다.
+     * SIM7080에서 AT&W가 ERROR일 수 있으므로, 저장 명령에 의존하지 않고
+     * 필요한 설정을 매 전원 세션에서 보장한다. */
     if (enable_time_auto_update) {
+        prv_wait_rx_quiet(100u, 400u);
+        prv_enable_network_time_auto_update();
         prv_wait_rx_quiet(100u, 400u);
     }
 
@@ -1065,15 +1082,18 @@ static void prv_enable_network_time_auto_update(void)
         return;
     }
 
-    s_catm1_time_auto_update_attempted_this_power = true;
+    /* 주기적인 시간/타임존 URC 노출은 막고, 자동 시간 보정은 유지한다.
+     * AT&W는 SIM7080에서 ERROR일 수 있으므로 사용하지 않는다. */
+    rsp[0] = '\0';
+    (void)prv_send_cmd_wait("AT+CTZR=0\r\n", "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
+    prv_wait_rx_quiet(100u, 300u);
+
     rsp[0] = '\0';
     if (!prv_send_cmd_wait("AT+CTZU=1\r\n", "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp))) {
         return;
     }
 
-    prv_wait_rx_quiet(100u, 400u);
-    rsp[0] = '\0';
-    (void)prv_send_cmd_wait("AT&W\r\n", "OK", NULL, NULL, UI_CATM1_AT_TIMEOUT_MS, rsp, sizeof(rsp));
+    s_catm1_time_auto_update_attempted_this_power = true;
     prv_wait_rx_quiet(100u, 400u);
 }
 
@@ -1163,6 +1183,28 @@ static uint64_t prv_compensate_cclk_epoch(uint64_t epoch_centi, uint32_t elapsed
         comp_centi = GW_CATM1_CCLK_QUERY_COMP_MAX_CENTI;
     }
     return epoch_centi + (uint64_t)comp_centi;
+}
+
+static bool prv_query_network_time_epoch_once(uint32_t timeout_ms, uint64_t* out_epoch_centi)
+{
+    char rsp[UI_CATM1_RX_BUF_SZ];
+    uint32_t query_start_ms;
+
+    if (out_epoch_centi == NULL) {
+        return false;
+    }
+
+    query_start_ms = HAL_GetTick();
+    if (!prv_send_query_wait_prefix_ok("AT+CCLK?\r\n", "+CCLK:", timeout_ms, rsp, sizeof(rsp))) {
+        return false;
+    }
+    if (!prv_parse_cclk_epoch(rsp, out_epoch_centi)) {
+        return false;
+    }
+
+    *out_epoch_centi = prv_compensate_cclk_epoch(*out_epoch_centi,
+                                                 (uint32_t)(HAL_GetTick() - query_start_ms));
+    return true;
 }
 
 static bool prv_query_network_time_epoch_retry(uint32_t max_try, uint32_t gap_ms,
@@ -1321,15 +1363,45 @@ static bool prv_sync_time_from_modem_startup(void)
 static bool prv_sync_time_from_modem(void)
 {
     uint64_t epoch_centi = 0u;
-    int64_t delta_sec;
 
     if (!prv_query_network_time_epoch(&epoch_centi)) {
         return false;
     }
-    delta_sec = (int64_t)(epoch_centi / 100u) - (int64_t)UI_Time_NowSec2016();
-    prv_time_sync_delta_push(delta_sec);
-    UI_Time_SetEpochCenti2016(epoch_centi);
+    prv_apply_time_epoch(epoch_centi, false);
     return true;
+}
+
+static bool prv_sync_time_from_modem_quick(bool notify_hook)
+{
+    uint64_t epoch_centi = 0u;
+
+    if (!prv_query_network_time_epoch_once(GW_CATM1_SERVER_CCLK_TIMEOUT_MS, &epoch_centi)) {
+        return false;
+    }
+    prv_apply_time_epoch(epoch_centi, notify_hook);
+    return true;
+}
+
+static void prv_sync_time_before_first_tcp_send(void)
+{
+    uint32_t try_idx;
+
+    if (!s_catm1_tcp_time_sync_pending) {
+        return;
+    }
+
+    for (try_idx = 0u; try_idx < GW_CATM1_SERVER_CCLK_SYNC_RETRY; try_idx++) {
+        if (prv_sync_time_from_modem_quick(true)) {
+            s_catm1_tcp_time_sync_pending = false;
+            return;
+        }
+        if ((try_idx + 1u) < GW_CATM1_SERVER_CCLK_SYNC_RETRY) {
+            prv_wait_rx_quiet(50u, 300u);
+            prv_delay_ms(GW_CATM1_SERVER_CCLK_SYNC_GAP_MS);
+        }
+    }
+
+    s_catm1_tcp_time_sync_pending = false;
 }
 
 static bool prv_query_gnss_loc_line(char* out, size_t out_sz)
@@ -1606,6 +1678,7 @@ static void prv_finish_power_off_state(void)
     s_catm1_tcp_open_fail_powerdown_pending = false;
     s_catm1_last_caopen_ms = 0u;
     s_catm1_time_auto_update_attempted_this_power = false;
+    s_catm1_tcp_time_sync_pending = false;
     s_catm1_startup_apn_configured_this_power = false;
     s_catm1_last_poweroff_ms = HAL_GetTick();
 }
@@ -1700,6 +1773,7 @@ static bool prv_open_tcp(const uint8_t ip[4], uint16_t port)
             if (result == 0u) {
                 s_catm1_last_caopen_ms = 0u;
                 s_catm1_tcp_open_fail_powerdown_pending = false;
+                s_catm1_tcp_time_sync_pending = true;
                 return true;
             }
             /* +CAOPEN: 0,0 이 아니면 cleanup에서 2초 기준으로 빠른 power down */
@@ -2086,6 +2160,8 @@ static bool prv_send_tcp_payload(const char* payload)
         return false;
     }
 
+    prv_sync_time_before_first_tcp_send();
+
     have_base = prv_query_caack(&base_total, &base_unack);
     if (!have_base) {
         base_total = 0u;
@@ -2391,6 +2467,7 @@ void GW_Catm1_Init(void)
     s_catm1_tcp_open_fail_powerdown_pending = false;
     s_catm1_last_caopen_ms = 0u;
     s_catm1_time_auto_update_attempted_this_power = false;
+    s_catm1_tcp_time_sync_pending = false;
     prv_power_leds_blink_twice();
 }
 
@@ -2403,6 +2480,7 @@ void GW_Catm1_PowerOn(void)
     s_catm1_tcp_open_fail_powerdown_pending = false;
     s_catm1_last_caopen_ms = 0u;
     s_catm1_time_auto_update_attempted_this_power = false;
+    s_catm1_tcp_time_sync_pending = false;
 
     if (s_catm1_last_poweroff_ms != 0u) {
         uint32_t elapsed = (uint32_t)(now - s_catm1_last_poweroff_ms);

@@ -1392,7 +1392,9 @@ void GW_App_Init(void)
     s_catm1_retry_not_before_ms = 0u;
     s_last_catm1_slot_id = 0xFFFFFFFFu;
     s_last_2m_prep_slot_id = 0xFFFFFFFFu;
-    s_boot_time_sync_pending = !UI_Time_IsValid();
+    /* MCU 부팅 시 SIM7080 초기 설정(1NCE APN 포함)을 수행하고
+     * 모뎀 시간도 즉시 읽어 보정한다. */
+    s_boot_time_sync_pending = true;
     prv_hour_rec_init(prv_get_current_cycle_timestamp_sec());
     s_inited = true;
     prv_schedule_wakeup();
